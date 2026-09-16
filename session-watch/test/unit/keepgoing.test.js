@@ -216,7 +216,9 @@ test("alarm kind lists: failures siren, relaunches chime", () => {
   for (const k of ["dead", "gone", "wedged", "frozen", "auth", "stalled", "humanVerification", "needsInput"]) {
     assert.ok(ALARM_SIREN_KINDS.includes(k), k);
   }
-  assert.deepEqual([...ALARM_CHIME_KINDS], ["relaunched"]);
+  // v1.2: "sentinel" joined the chime kinds (a finished runbook is the
+  // watchdog acting, not crying for help)
+  assert.deepEqual([...ALARM_CHIME_KINDS], ["relaunched", "sentinel"]);
 });
 
 /* ── the diagnostic dump (redaction is the law) ─────────────── */

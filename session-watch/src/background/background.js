@@ -16,7 +16,8 @@ import {
 import {
   createSessionRecord, pushSessionEvent, resetIncident,
   resetRelaunchBudget, mayNotify, markNotified, boundSessions,
-  sessionUrlFromTab, labelOf,
+  sessionUrlFromTab, labelOf, sanitizeSentinelPrompts, createSentinel,
+  advanceSentinel,
 } from "../state.js";
 import { planAction, ACTION, effectiveRelaunchMessage } from "../recovery.js";
 import { makeNotify } from "./notify.js";
@@ -169,6 +170,44 @@ async function serverProbeFact(session) {
 /* ────────────────────────── the keep-going send ────────────────────────── */
 
 /**
+ * Post-send sentinel bookkeeping (v1.2): advance the runbook on a
+ * CONFIRMED delivery, announce progress, and chime + notify when the
+ * runbook finishes. A `text` that is not the queue head never consumes
+ * a prompt (advanceSentinel's own guard).
+ */
+function sentinelAfterSend(session, text) {
+  if (!session || !session.sentinel) return;
+  const outcome = advanceSentinel(session, text);
+  if (outcome === "ignored") return;
+  const sen = session.sentinel;
+  const now = Date.now();
+  if (outcome === "complete") {
+    const total = sen ? sen.total : 0;
+    session.sentinel = null;
+    pushSessionEvent(session, {
+      ts: now,
+      kind: "sentinel-complete",
+      detail: `runbook finished — ${total} prompt${total === 1 ? "" : "s"} delivered`,
+    });
+    globalEvent("sentinel-complete", `${labelOf(session)}: runbook finished (${total} prompts delivered)`, session.sessionId);
+    // the completion chime rides the same throttled notify() path as
+    // every other alert (cooldown map: sentinel = 5 min)
+    notify(session, {
+      kind: "sentinel",
+      message: `Sentinel finished — ${total} prompt${total === 1 ? "" : "s"} delivered to ${labelOf(session)}`,
+    });
+  } else {
+    pushSessionEvent(session, {
+      ts: now,
+      kind: "sentinel-send",
+      detail: `prompt ${sen.sentCount}/${sen.total} delivered; next: "${String(sen.queue[0] || "").slice(0, 60)}"`,
+    });
+    globalEvent("sentinel-send", `${labelOf(session)}: runbook ${sen.sentCount}/${sen.total} delivered`, session.sessionId);
+  }
+  persist();
+}
+
+/**
  * Execute one relaunch-message send through the content sensor and
  * return its verdict (never throws). A failed send leaves no draft.
  */
@@ -216,6 +255,7 @@ async function flushPendingMessage(session, snap, tab) {
     session.lastMessageSentAt = now;
     session.turnOpen = true;
     session.idleSince = 0;
+    if (p.sentinel === true) sentinelAfterSend(session, p.text);
     pushSessionEvent(session, {
       ts: now,
       kind: "send-message",
@@ -284,7 +324,7 @@ async function executePlan(session, plan) {
       if (plan.sendMessage) {
         // the relaunch message rides along: delivered once the tab is back
         // on the session URL and the composer is free (flush owns it)
-        session.pendingMessage = { text: plan.sendMessage, reason: plan.reason, setAt: now, attempts: 0 };
+        session.pendingMessage = { text: plan.sendMessage, reason: plan.reason, setAt: now, attempts: 0, sentinel: plan.sentinel === true };
       }
       globalEvent("navigate-back", `${session.sessionId}: ${plan.reason}${plan.sendMessage ? " (relaunch message queued)" : ""}`, session.sessionId);
       break;
@@ -323,17 +363,19 @@ async function executePlan(session, plan) {
       break;
     }
     case ACTION.SEND_MESSAGE: {
-      // the keep-going relaunch (v1.1): send now; on failure the pending
-      // message owns bounded retries on the next ticks
+      // the keep-going relaunch (v1.1) / the sentinel prompt (v1.2):
+      // send now; on failure the pending message owns bounded retries
+      // on the next ticks
       const r = await sendRelaunchMessage(session, plan.sendMessage || "");
       if (r.ok) {
         session.lastMessageSentAt = now;
         session.turnOpen = true;
         session.idleSince = 0;
+        if (plan.sentinel === true) sentinelAfterSend(session, plan.sendMessage || "");
         pushSessionEvent(session, {
           ts: now,
           kind: "send-message",
-          detail: `relaunch message sent: "${String(plan.sendMessage).slice(0, 60)}" (verified: ${r.verified})`,
+          detail: `${plan.sentinel === true ? "sentinel prompt" : "relaunch message"} sent: "${String(plan.sendMessage).slice(0, 60)}" (verified: ${r.verified})`,
         });
         globalEvent("send-message", `${labelOf(session)}: "${String(plan.sendMessage).slice(0, 60)}" sent`, session.sessionId);
         if (!r.verified) {
@@ -342,7 +384,7 @@ async function executePlan(session, plan) {
           pushSessionEvent(session, { ts: now, kind: "send-unverified", detail: "turn not observed open after the send; re-checking next tick" });
         }
       } else {
-        session.pendingMessage = { text: plan.sendMessage, reason: plan.reason, setAt: now, attempts: 1 };
+        session.pendingMessage = { text: plan.sendMessage, reason: plan.reason, setAt: now, attempts: 1, sentinel: plan.sentinel === true };
         pushSessionEvent(session, {
           ts: now,
           kind: "send-retry",
@@ -683,6 +725,46 @@ async function handleMessage(msg, sender) {
       }
       pushSessionEvent(rec, { ts: Date.now(), kind: "manual-relaunch", detail: "operator relaunched" });
       globalEvent("manual-relaunch", rec.sessionId, rec.sessionId);
+      persist();
+      return { ok: true };
+    }
+    case EVT.SENTINEL_START: {
+      // v1.2 — the operator's runbook: "have the extension setup a
+      // sentinel that runs the prompts just like we've been doing."
+      // One prompt per turn, in order, starting from the next free
+      // composer past the grace. A fresh runbook supersedes any stale
+      // pending send and opens a fresh budget.
+      const rec = sessions[msg.sessionUrl];
+      if (!rec) return { ok: false, error: "unknown-session" };
+      const prompts = sanitizeSentinelPrompts(msg.prompts);
+      if (prompts.length === 0) return { ok: false, error: "no-prompts" };
+      rec.sentinel = createSentinel(prompts, Date.now());
+      rec.pendingMessage = null; // the runbook supersedes the stale queue
+      resetRelaunchBudget(rec);
+      if (rec.status === STATUS.NEEDS_INPUT) rec.status = STATUS.WATCHING;
+      pushSessionEvent(rec, {
+        ts: Date.now(),
+        kind: "sentinel-start",
+        detail: `runbook armed — ${prompts.length} prompt${prompts.length === 1 ? "" : "s"}; first: "${prompts[0].slice(0, 60)}"`,
+      });
+      globalEvent("sentinel-start", `${labelOf(rec)}: runbook of ${prompts.length} prompt${prompts.length === 1 ? "" : "s"} armed`, rec.sessionId);
+      updateBadge();
+      persist();
+      return { ok: true, session: rec };
+    }
+    case EVT.SENTINEL_STOP: {
+      const rec = sessions[msg.sessionUrl];
+      if (!rec || !rec.sentinel) return { ok: false, error: "no-sentinel" };
+      const sen = rec.sentinel;
+      const delivered = typeof sen.sentCount === "number" ? sen.sentCount : 0;
+      const total = typeof sen.total === "number" ? sen.total : 0;
+      rec.sentinel = null;
+      pushSessionEvent(rec, {
+        ts: Date.now(),
+        kind: "sentinel-stop",
+        detail: `runbook stopped by the operator — ${delivered}/${total} delivered, ${(sen.queue || []).length} left`,
+      });
+      globalEvent("sentinel-stop", `${labelOf(rec)}: runbook stopped (${delivered}/${total} delivered)`, rec.sessionId);
       persist();
       return { ok: true };
     }

@@ -80,7 +80,11 @@ export function buildDiagDump(input) {
       lines.push(`  relaunchMessage(own): ${JSON.stringify(trimTo(String(s.relaunchMessage), MESSAGE_MAX))}`);
     }
     if (s.pendingMessage && typeof s.pendingMessage === "object") {
-      lines.push(`  pendingMessage: ${JSON.stringify(trimTo(String(s.pendingMessage.text || ""), 80))} attempts=${s.pendingMessage.attempts || 0} setAt=${iso(s.pendingMessage.setAt || 0)}`);
+      lines.push(`  pendingMessage: ${JSON.stringify(trimTo(String(s.pendingMessage.text || ""), 80))} attempts=${s.pendingMessage.attempts || 0} setAt=${iso(s.pendingMessage.setAt || 0)}${s.pendingMessage.sentinel ? " (sentinel)" : ""}`);
+    }
+    if (s.sentinel && typeof s.sentinel === "object" && Array.isArray(s.sentinel.queue)) {
+      const q = s.sentinel.queue;
+      lines.push(`  sentinel: ${s.sentinel.sentCount || 0}/${s.sentinel.total || 0} delivered, ${q.length} queued; next: ${JSON.stringify(trimTo(String(q[0] || ""), 60))}`);
     }
     const evts = Array.isArray(s.events) ? s.events.slice(-12) : [];
     if (evts.length > 0) {

@@ -299,3 +299,53 @@ ntfy.sh and a generic webhook are optional zero/low-setup push channels.
   version, redacted settings, per-session verdicts/counters/pending
   messages + bounded event trails, global events. Paste-ready for an
   issue; secrets never leave the machine.
+
+## 11. The sentinel runbook (v1.2 — the 2026-10-15 operator direction)
+
+The operator's words: *"I think a better idea would be to have the
+extension setup a sentinel that runs the prompts just like we've been
+doing."* v1.1's keep-going answers "a turn ended, what do I say?" with
+ONE repeated message. The sentinel upgrades the operator's seat: hand
+the extension the whole list of prompts — the runbook — and it drives
+the session the way the operator would by hand: prompt, wait for the
+turn to complete, next prompt, in order, to the end.
+
+**The record** (state.js, pure helpers): `session.sentinel` is `null`
+or `{queue, total, sentCount, startedAt}`. The queue holds the REMAINING
+prompts (front = next); it rides `storage.local`, so a runbook survives
+browser restarts (law 9) and chat-id rolls (the record follows the
+roll). `sanitizeSentinelPrompts` never trusts input: trim, drop blanks,
+cap each prompt at MESSAGE_MAX, cap the count at SENTINEL_MAX_PROMPTS.
+
+**The ladder** (recovery.js `sentinelPlan`, reached from keep-going
+guard 2 — BEFORE the keep-going OFF switches): a live runbook OVERRIDES
+`relaunchOnTurnEnd=false` and any per-session keep-going message — the
+operator explicitly asked for THESE prompts. Everything else is the same
+law as keep-going:
+
+- a pending (in-flight/failed) send still owns the window — one queue,
+  two entry points (idle composer, RETURNED navigate-back);
+- a human draft PAUSES the runbook (never clobber — the sentinel waits);
+- the same quiet grace (`turnEndGraceSeconds` — one clock, one knob);
+- the same bounded budget: a turn reopening RESETS it (productive
+  runbooks are infinite by design); a blocked-send loop terminates in
+  NEEDS_INPUT with the queue **INTACT** — the operator's manual
+  relaunch (which resets the budget) resumes the runbook where it
+  stuck; the notification names the position ("sentinel stuck at 3/7").
+
+**The actuation** is the v1.1 `sw-send-message` path unchanged — free
+composer only, React-safe typing, verified turn-open. On a CONFIRMED
+delivery the queue advances (`advanceSentinel` — a text that is not the
+queue head never consumes a prompt, so a manual relaunch message cannot
+eat the runbook). The LAST prompt's delivery completes the runbook:
+`sentinel-complete` event + a "sentinel" CHIME (the watchdog acted, it
+did not cry for help) through the same throttled notify path (cooldown
+5 min). Afterwards the normal ladder keeps watching the final turn
+(freeze detection, and keep-going if the last response stops early).
+
+**The surfaces**: the popup card carries a "sentinel…" editor (one
+prompt per line — the exact shape the E2E drives) with a live
+"3/7 · next: …" progress line and a stop button; the diagnostics dump
+carries the runbook position; `sw-sentinel-start` / `sw-sentinel-stop`
+are the typed popup→background events. A fresh runbook supersedes any
+stale pending send and opens a fresh budget.

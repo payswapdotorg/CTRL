@@ -182,20 +182,41 @@ def new_chat(title):
 
 
 def find_extension_id(wake=True):
-    for t in cdp_tabs():
-        url = t.get("url", "")
-        if url.startswith("chrome-extension://") and "/background.js" in url:
-            return url.split("/")[2].split("/")[0]
+    def scan():
+        for t in cdp_tabs():
+            url = t.get("url", "")
+            if url.startswith("chrome-extension://") and "/background.js" in url:
+                return url.split("/")[2].split("/")[0]
+        return None
+
+    hit = scan()
+    if hit:
+        return hit
     if wake:
         # MV3 service workers go dormant; a content-script page wakes the
         # background (the announce message), which surfaces the target
         t, tid = open_tab(f"{HARNESS}/wake")
         time.sleep(2.0)
         close_tab(tid)
-        for t2 in cdp_tabs():
-            url = t2.get("url", "")
-            if url.startswith("chrome-extension://") and "/background.js" in url:
-                return url.split("/")[2].split("/")[0]
+        hit = scan()
+        if hit:
+            return hit
+        # Chrome 151 lesson: --load-extension can half-register (the SW
+        # boots once, then blocks). The CDP Extensions domain (armed by
+        # --enable-unsafe-extension-automation) loads it deterministically.
+        try:
+            bws = json.load(urllib.request.urlopen(f"{CDP}/json/version", timeout=5))["webSocketDebuggerUrl"]
+            build_test = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build", "test"))
+            ws = websocket.create_connection(bws, timeout=15)
+            ws.send(json.dumps({"id": 1, "method": "Extensions.loadUnpacked", "params": {"path": build_test}}))
+            ws.recv()
+            ws.close()
+            time.sleep(2.0)
+        except Exception as e:
+            log(f"  Extensions.loadUnpacked fallback failed: {e}")
+        hit = scan()
+        if hit:
+            return hit
     return None
 
 
@@ -243,6 +264,13 @@ class Popup:
 
     def update_session(self, session_url, patch):
         return self.raw_send({"evt": "sw-update-session", "sessionUrl": session_url, **patch})
+
+    def sentinel_start(self, session_url, prompts):
+        # prompts: the newline blob exactly as the popup textarea sends it
+        return self.raw_send({"evt": "sw-sentinel-start", "sessionUrl": session_url, "prompts": prompts})
+
+    def sentinel_stop(self, session_url):
+        return self.raw_send({"evt": "sw-sentinel-stop", "sessionUrl": session_url})
 
     def export_diag(self):
         return self.raw_send({"evt": "sw-export-diag"}, timeout=30)
@@ -628,6 +656,61 @@ def main():
     control(cid_l, "unblock-send")
     control(cid_l, "normal")
 
+    # ── M. SENTINEL: the runbook drives the session, one prompt per ──
+    #    turn, in order, then completes (the v1.2 law) ────────────────
+    log("M. sentinel runbook")
+    cid_m, tab_m, tid_m = fresh_session("worker-sentinel")
+    time.sleep(2.5)
+    mur = f"{HARNESS}/c/{cid_m}"
+    control(cid_m, "normal")
+    tab_m.navigate(mur)  # idle shape: the turn is closed, composer free
+    time.sleep(2.0)
+
+    # arm a two-prompt runbook through the exact popup textarea shape
+    r = popup.sentinel_start(mur, "first: build the flange mount\nsecond: ship it and summarize")
+    check("M1 runbook armed (2 prompts)", bool(r and r.get("ok") and r.get("session", {}).get("sentinel", {}).get("total") == 2), str(r))
+
+    def _first_landed(st_):
+        s = session_by_url(st_ or {}, mur)
+        return bool(s and "sentinel-send" in events_of(s) and any(t == "first: build the flange mount" for t in harness_messages(cid_m)))
+
+    log("  pumping ticks through the grace until prompt 1/2 lands…")
+    st = pump_until(popup, _first_landed, timeout_s=180, interval=5.0)
+    sm = session_by_url(st or {}, mur)
+    msgs = harness_messages(cid_m)
+    check("M2 prompt 1 delivered (in order, first)", msgs.index("first: build the flange mount") == 0, str(msgs))
+    check("M3 runbook advanced to 1/2", bool(sm and (sm.get("sentinel") or {}).get("sentCount") == 1), str((sm or {}).get("sentinel")))
+
+    # the turn is open (the harness flipped to generating on the send);
+    # close it, reload into the idle shape, and let the sentinel continue
+    control(cid_m, "normal")
+    tab_m.navigate(mur)
+    time.sleep(2.0)
+
+    def _complete(st_):
+        s = session_by_url(st_ or {}, mur)
+        return bool(s and "sentinel-complete" in events_of(s) and not s.get("sentinel"))
+
+    log("  pumping ticks through the grace until prompt 2/2 lands and completes…")
+    st = pump_until(popup, _complete, timeout_s=180, interval=5.0)
+    sm = session_by_url(st or {}, mur)
+    msgs = harness_messages(cid_m)
+    check("M4 prompt 2 delivered after the second turn", sum(1 for t in msgs if t == "second: ship it and summarize") == 1, str(msgs))
+    check("M5 prompts ran IN ORDER", msgs.index("first: build the flange mount") < msgs.index("second: ship it and summarize"), str(msgs))
+    check("M6 sentinel-complete event + record cleared", bool(sm and "sentinel-complete" in events_of(sm) and not sm.get("sentinel")), str(events_of(sm)))
+
+    # the diagnostics carry the sentinel story while one is armed
+    r = popup.sentinel_start(mur, "third: one more for the diag")
+    check("M7 second runbook armed", bool(r and r.get("ok")), str(r))
+    d = popup.export_diag()
+    text = (d or {}).get("text") or ""
+    check("M8 diagnostics carry the runbook", "sentinel:" in text and "third: one more for the diag"[:20] in text, text[:300])
+    r = popup.sentinel_stop(mur)
+    check("M9 runbook stopped by the operator", bool(r and r.get("ok")), str(r))
+    st = popup.state()
+    sm = session_by_url(st, mur)
+    check("M10 sentinel-stop event + record cleared", bool(sm and "sentinel-stop" in events_of(sm) and not sm.get("sentinel")), str(events_of(sm)))
+
     # ── final: the badge + honest summary ─────────────────────────
     st = popup.state()
     total = len([s for s in st.get("sessions", []) if s.get("armed")])
@@ -641,7 +724,7 @@ def main():
 
     if not keep:
         popup.close()
-        cleanup_ids = [tid_e, tid_j, tid_k, tid_l, find_tab_id_for_session(cid_a)]
+        cleanup_ids = [tid_e, tid_j, tid_k, tid_l, tid_m, find_tab_id_for_session(cid_a)]
         cleanup_ids = [t for t in cleanup_ids if t and str(t) != str(tid_a)]
         cleanup_ids.append(tid_a)
         for tid in cleanup_ids:

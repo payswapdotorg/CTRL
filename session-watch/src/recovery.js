@@ -9,7 +9,7 @@
  */
 
 import { STATUS, classifyUrl } from "./protocol.js";
-import { resetIncident, labelOf } from "./state.js";
+import { resetIncident, labelOf, sentinelNextPrompt, sentinelProgress } from "./state.js";
 
 /** Typed plan action kinds. */
 export const ACTION = Object.freeze({
@@ -346,11 +346,13 @@ export function planAction(input) {
  * The KEEP-GOING ladder (DESIGN §7): the tab is on its session URL, the
  * page answers, and the composer is free. Guards, in order:
  *   1. a pending (in-flight/failed) send owns the retries while it lives
- *   2. keep-going OFF (setting or empty resolved message) -> plain IDLE
- *   3. a human draft in the composer -> IDLE, keep-going paused
- *   4. within the quiet grace -> IDLE, waiting (idleSince tracked)
- *   5. grace passed + budget -> SEND the relaunch message
- *   6. grace passed + budget exhausted -> NEEDS_INPUT (siren + email)
+ *   2. a live SENTINEL runbook (v1.2) — the operator's explicit prompt
+ *      queue — drives this window, even when keep-going is OFF
+ *   3. keep-going OFF (setting or empty resolved message) -> plain IDLE
+ *   4. a human draft in the composer -> IDLE, keep-going paused
+ *   5. within the quiet grace -> IDLE, waiting (idleSince tracked)
+ *   6. grace passed + budget -> SEND the relaunch message
+ *   7. grace passed + budget exhausted -> NEEDS_INPUT (siren + email)
  */
 function keepGoingPlan(input) {
   const { now, settings, session, snapshot } = input;
@@ -363,7 +365,18 @@ function keepGoingPlan(input) {
     });
   }
 
-  // 2. keep-going disabled (setting off, or the resolved message is OFF)
+  // 2. THE SENTINEL (v1.2 — operator 2026-10-15: "have the extension
+  // setup a sentinel that runs the prompts just like we've been doing").
+  // An armed runbook is an explicit operator program: it sends its
+  // prompts one turn at a time and OVERRIDES the generic keep-going
+  // switches (a runbook runs even when relaunchOnTurnEnd is OFF — the
+  // operator asked for THESE prompts). Same guards otherwise: never
+  // over a human draft, same quiet grace, same bounded budget.
+  if (sentinelNextPrompt(session) !== null) {
+    return sentinelPlan(input);
+  }
+
+  // 3. keep-going disabled (setting off, or the resolved message is OFF)
   const message = effectiveRelaunchMessage(session, settings);
   if (settings.relaunchOnTurnEnd !== true || message === null) {
     return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "idle", {
@@ -375,7 +388,7 @@ function keepGoingPlan(input) {
     });
   }
 
-  // 3. a human draft: someone is typing — never clobber their text
+  // 4. a human draft: someone is typing — never clobber their text
   if (snapshot.composerHasDraft === true) {
     return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "draft-present", {
       clearIdle: true,
@@ -383,7 +396,7 @@ function keepGoingPlan(input) {
     });
   }
 
-  // 4. the grace window: idleSince starts at the FIRST free-composer
+  // 5. the grace window: idleSince starts at the FIRST free-composer
   // observation (transition-independent — survives SW restarts and
   // missed edges, the exact shape of the live failure). The mutation
   // clock is the snapshot's (the sensor's live fact), falling back to
@@ -405,7 +418,7 @@ function keepGoingPlan(input) {
     });
   }
 
-  // 5. grace passed — the turn ended and NOBODY came back: relaunch it
+  // 6. grace passed — the turn ended and NOBODY came back: relaunch it
   if ((session.relaunchAttempts || 0) < settings.relaunchCap) {
     return plan(STATUS.RECOVERING, ACTION.SEND_MESSAGE, "turn-ended", {
       relaunchAttempt: true,
@@ -419,13 +432,80 @@ function keepGoingPlan(input) {
     });
   }
 
-  // 6. budget exhausted: the sends did not reopen a turn — a human is needed
+  // 7. budget exhausted: the sends did not reopen a turn — a human is needed
   return plan(STATUS.NEEDS_INPUT, ACTION.EVENT_ONLY, "idle-budget", {
     notify: {
       kind: "needsInput",
       message: `Session ${labelOf(session)} returned but ${settings.relaunchCap} relaunch ${settings.relaunchCap === 1 ? "message" : "messages"} failed to reopen the turn — it needs you`,
     },
     events: [ev(now, "needs-input", "relaunch budget exhausted on an idle turn; needs a human message")],
+  });
+}
+
+/**
+ * THE SENTINEL ladder (v1.2, DESIGN §11): an armed runbook of prompts
+ * runs the session — one prompt per turn, in order, exactly like the
+ * operator driving it by hand. The composer being free is the trigger;
+ * the same quiet grace applies (the operator may be mid-thought, the
+ * UI may still be settling); the same bounded budget applies (a turn
+ * reopening resets it — productive runbooks are infinite; a blocked
+ * loop terminates in NEEDS_INPUT with the queue INTACT for a manual
+ * relaunch to resume).
+ */
+function sentinelPlan(input) {
+  const { now, settings, session, snapshot } = input;
+  const graceMs = settings.turnEndGraceSeconds * 1000;
+  const prompt = sentinelNextPrompt(session);
+
+  // a human draft: the sentinel WAITS, never clobbers (the same law)
+  if (snapshot.composerHasDraft === true) {
+    return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "sentinel-paused", {
+      clearIdle: true,
+      events: [ev(now, "sentinel-paused", `composer holds a draft (a human is typing); sentinel ${sentinelProgress(session)} waiting`)],
+    });
+  }
+
+  // the same quiet grace as keep-going (one clock, one knob)
+  const idleSince =
+    typeof session.idleSince === "number" && session.idleSince > 0
+      ? session.idleSince
+      : now;
+  const idleMs = now - idleSince;
+  const mutationAt =
+    typeof snapshot.lastMutationAt === "number"
+      ? snapshot.lastMutationAt
+      : session.lastMutationAt || 0;
+  const quietMs = now - mutationAt;
+  if (idleMs < graceMs || quietMs < graceMs) {
+    return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "idle-waiting", {
+      resetIncident: true,
+      setIdleSince: idleSince === now ? now : undefined,
+    });
+  }
+
+  // grace passed: send the next runbook prompt
+  if ((session.relaunchAttempts || 0) < settings.relaunchCap) {
+    return plan(STATUS.RECOVERING, ACTION.SEND_MESSAGE, "sentinel-next", {
+      relaunchAttempt: true,
+      sendMessage: prompt,
+      sentinel: true,
+      clearIdle: true,
+      notify: {
+        kind: "relaunched",
+        message: `Session ${labelOf(session)} sentinel ${sentinelProgress(session)} — sending "${trimTo(prompt, 60)}"`,
+      },
+      events: [ev(now, "sentinel-send", `sentinel ${sentinelProgress(session)}: sending the next prompt past the ${settings.turnEndGraceSeconds}s grace`)],
+    });
+  }
+
+  // budget exhausted — the runbook is STUCK, not dropped: the queue
+  // stays armed so a manual relaunch (which resets the budget) resumes it
+  return plan(STATUS.NEEDS_INPUT, ACTION.EVENT_ONLY, "sentinel-budget", {
+    notify: {
+      kind: "needsInput",
+      message: `Session ${labelOf(session)} sentinel stuck at ${sentinelProgress(session)} — ${settings.relaunchCap} sends failed to reopen the turn; it needs you`,
+    },
+    events: [ev(now, "sentinel-blocked", "sentinel sends exhausted the relaunch budget; queue kept for a manual relaunch to resume")],
   });
 }
 
@@ -446,11 +526,15 @@ function returnedPlan(input) {
         // it — but this time with a message I can customize." The message
         // is queued on the session; the background sends it once the tab
         // is back on the session URL and the composer is free (no open
-        // turn — never injected mid-generation).
-        const message = effectiveRelaunchMessage(session, settings);
+        // turn — never injected mid-generation). A live SENTINEL runbook
+        // (v1.2) owns the slot instead: its next prompt rides the
+        // navigate-back.
+        const sentinelPrompt = sentinelNextPrompt(session);
+        const message = sentinelPrompt !== null ? sentinelPrompt : effectiveRelaunchMessage(session, settings);
         return plan(STATUS.RECOVERING, ACTION.NAVIGATE_BACK, "returned-alive", {
           relaunchAttempt: true,
           sendMessage: message || undefined,
+          sentinel: sentinelPrompt !== null || undefined,
           notify: {
             kind: "relaunched",
             message: `Session ${labelOf(session)} returned to the home page — taking it back${

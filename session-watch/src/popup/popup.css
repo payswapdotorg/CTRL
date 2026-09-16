@@ -413,6 +413,53 @@ button:focus-visible, a:focus-visible {
 }
 .sw-msg-input:focus { border-color: var(--accent); outline: none; }
 
+/* ── v1.2: the sentinel runbook row ────────────────────────────── */
+
+.sw-sen-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 2px;
+  flex-wrap: wrap;
+}
+.sw-sen-info {
+  flex: 1;
+  min-width: 140px;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 7px;
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sw-sen-box {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.sw-sen-box[hidden] { display: none; }
+.sw-sen-text {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 9px;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  resize: vertical;
+  min-height: 64px;
+}
+.sw-sen-text:focus { border-color: var(--accent); outline: none; }
+.sw-sen-text::placeholder { color: var(--muted); }
+
 /* ── v1.1: settings extras (keep-going, alerts) ──────────────── */
 
 .sw-section-note { color: var(--muted); font-weight: 400; font-size: 10px; margin-left: 4px; }

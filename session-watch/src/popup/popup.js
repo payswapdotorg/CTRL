@@ -26,6 +26,8 @@ const EVT = {
   ALARM_ACK: "sw-alarm-ack",
   ALARM_TEST: "sw-alarm-test",
   EMAIL_TEST: "sw-email-test",
+  SENTINEL_START: "sw-sentinel-start",
+  SENTINEL_STOP: "sw-sentinel-stop",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -63,14 +65,27 @@ async function refresh() {
 function render() {
   renderSummary();
   renderAlarmBanner();
-  renderSessions();
-  renderTabs();
-  renderLog();
-  if (!$("settingsView").hidden) {
-    renderSettingsForm();
-    renderKeepGoingForm();
-    renderAlertsForm();
+  // v1.2 edit-guard: the 2s poll rebuilds cards and forms, which would
+  // wipe a half-typed name, relaunch message or sentinel runbook — skip
+  // the rebuilding renders while the operator is focused on an editor
+  if (!operatorIsEditing()) {
+    renderSessions();
+    renderTabs();
+    if (!$("settingsView").hidden) {
+      renderSettingsForm();
+      renderKeepGoingForm();
+      renderAlertsForm();
+    }
   }
+  renderLog();
+}
+
+/** True while the operator is focused on any editor in the popup. */
+function operatorIsEditing() {
+  const a = document.activeElement;
+  if (!a || !a.tagName) return false;
+  const tag = String(a.tagName).toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || a.isContentEditable === true;
 }
 
 function renderSummary() {
@@ -225,6 +240,63 @@ function sessionCard(s) {
   });
   msgRow.append(msgLabel, msgSel, msgInput, msgSave);
   card.appendChild(msgRow);
+
+  // the sentinel runbook (v1.2): "have the extension setup a sentinel
+  // that runs the prompts just like we've been doing" — a queue of
+  // prompts the extension sends one per turn, in order, automatically
+  const senRow = el("div", "sw-sen-row");
+  const sen = s.sentinel && Array.isArray(s.sentinel.queue) ? s.sentinel : null;
+  if (sen) {
+    const info = el("div", "sw-sen-info");
+    const sentCount = typeof sen.sentCount === "number" ? sen.sentCount : 0;
+    const total = typeof sen.total === "number" ? sen.total : sen.queue.length;
+    info.textContent =
+      `\u25B8 sentinel ${sentCount}/${total}` +
+      (sen.queue.length > 0 ? ` \u00b7 next: ${String(sen.queue[0] || "").slice(0, 40)}` : " \u00b7 finishing");
+    info.title =
+      sen.queue.length > 0
+        ? `Runbook armed — ${sen.queue.length} prompt(s) left. The sentinel sends one prompt per turn, in order.`
+        : "Runbook drained — the last prompt's turn is still watched.";
+    senRow.appendChild(info);
+    const stopBtn = el("button", "sw-btn sw-btn-mini sw-btn-danger", "stop");
+    stopBtn.title = "Stop the sentinel runbook (queued prompts are dropped)";
+    stopBtn.addEventListener("click", async () => {
+      stopBtn.disabled = true;
+      await send({ evt: EVT.SENTINEL_STOP, sessionUrl: s.sessionUrl });
+      await refresh();
+    });
+    senRow.appendChild(stopBtn);
+  } else {
+    const senToggle = el("button", "sw-btn sw-btn-mini", "sentinel\u2026");
+    senToggle.title = "Run a list of prompts automatically — one per turn, in order, like you driving the session by hand";
+    const senBox = el("div", "sw-sen-box");
+    senBox.hidden = true;
+    const ta = document.createElement("textarea");
+    ta.className = "sw-sen-text";
+    ta.rows = 4;
+    ta.placeholder = "one prompt per line\u2026\nbuild the flange mount\ncontinue\ncontinue\nship it and summarize";
+    ta.setAttribute("aria-label", `Sentinel prompts for session ${shortId(s.sessionId)}`);
+    const startBtn = el("button", "sw-btn sw-btn-mini", "start");
+    startBtn.title = "Arm the sentinel — prompts are sent one per turn after the turn-end grace";
+    startBtn.addEventListener("click", async () => {
+      startBtn.disabled = true;
+      const r = await send({ evt: EVT.SENTINEL_START, sessionUrl: s.sessionUrl, prompts: ta.value });
+      if (!r || !r.ok) {
+        startBtn.disabled = false;
+        ta.value = "";
+        ta.placeholder = `cannot arm the sentinel: ${(r && r.error) || "no answer"}`;
+        return;
+      }
+      await refresh();
+    });
+    senBox.append(ta, startBtn);
+    senToggle.addEventListener("click", () => {
+      senBox.hidden = !senBox.hidden;
+      if (!senBox.hidden) ta.focus();
+    });
+    senRow.append(senToggle, senBox);
+  }
+  card.appendChild(senRow);
 
   const actions = el("div", "sw-card-actions");
 

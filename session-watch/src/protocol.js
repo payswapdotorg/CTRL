@@ -46,6 +46,8 @@ export const EVT = Object.freeze({
   ALARM_ACK: "sw-alarm-ack",               // silence the active alarm
   ALARM_TEST: "sw-alarm-test",             // ring the alarm once (settings)
   EMAIL_TEST: "sw-email-test",             // send a test email (settings)
+  SENTINEL_START: "sw-sentinel-start",     // v1.2: arm the prompt runbook
+  SENTINEL_STOP: "sw-sentinel-stop",       // v1.2: stop the runbook
 });
 
 /** The provider origin (the shipped surface). */
@@ -86,6 +88,8 @@ export const PENDING_MESSAGE_TTL_MS = 10 * 60 * 1000;
 export const PENDING_MESSAGE_ATTEMPTS = 3;
 /** The alarm hard-stops after this (ms) even if never acknowledged. */
 export const ALARM_HARD_STOP_MS = 30 * 60 * 1000;
+/** v1.2 — the sentinel runbook bounds (a queue of prompts, one per turn). */
+export const SENTINEL_MAX_PROMPTS = 100;
 
 /** Notification kinds that ring the LOOPING SIREN (needs a human). */
 export const ALARM_SIREN_KINDS = Object.freeze([
@@ -93,7 +97,7 @@ export const ALARM_SIREN_KINDS = Object.freeze([
   "humanVerification", "needsInput",
 ]);
 /** Notification kinds that ring the SHORT CHIME (the watchdog acted). */
-export const ALARM_CHIME_KINDS = Object.freeze(["relaunched"]);
+export const ALARM_CHIME_KINDS = Object.freeze(["relaunched", "sentinel"]);
 /** Email/alert endpoint hosts (manifest host_permissions). */
 export const ALERT_HOSTS = Object.freeze([
   "https://api.brevo.com/*",
@@ -233,6 +237,7 @@ export function classifyUrl(rawUrl, providerOrigin) {
 /** Notification throttle windows per kind (ms). */
 export const NOTIFY_COOLDOWN_MS = Object.freeze({
   relaunched: 10 * 60 * 1000,
+  sentinel: 5 * 60 * 1000,
   dead: 30 * 60 * 1000,
   auth: 30 * 60 * 1000,
   frozen: 15 * 60 * 1000,

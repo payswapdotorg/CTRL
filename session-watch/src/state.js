@@ -7,7 +7,7 @@
  * and `tabId` is always just the current binding).
  */
 
-import { STATUS, SESSION_EVENT_RING, MAX_SESSIONS, NAME_MAX } from "./protocol.js";
+import { STATUS, SESSION_EVENT_RING, MAX_SESSIONS, NAME_MAX, MESSAGE_MAX, SENTINEL_MAX_PROMPTS } from "./protocol.js";
 
 /**
  * Create a fresh armed session record.
@@ -28,6 +28,10 @@ export function createSessionRecord(input) {
     titleHint: "",                // first user message text (sensor-derived)
     relaunchMessage: null,        // null = inherit global setting; "" = off; "text" = custom
     pendingMessage: null,         // {text, reason, setAt, attempts} while a send is pending
+    // the sentinel runbook (v1.2): null, or the operator's explicit
+    // prompt queue the extension drives one turn at a time — "runs the
+    // prompts just like we've been doing" (operator 2026-10-15)
+    sentinel: null,               // {queue:[...], total:n, sentCount:n, startedAt:ts}
     // keep-going ladder (v1.1): when the composer was first seen free
     idleSince: 0,                 // ts of the first turnOpen===false observation
     lastMessageSentAt: 0,         // ts of our last successful relaunch message
@@ -158,4 +162,81 @@ export function sessionUrlFromTab(tabUrl, providerOrigin) {
   const m = /^\/c\/([0-9a-fA-F-]{6,64})(?:\/.*)?$/.exec(u.pathname);
   if (!m) return null;
   return { sessionUrl: `${providerOrigin}/c/${m[1]}`, sessionId: m[1] };
+}
+
+/* ─────────── the sentinel runbook (v1.2 — pure helpers) ─────────── */
+
+/**
+ * Sanitize an operator runbook: an array of strings OR one newline-
+ * separated blob -> trimmed, blank lines dropped, each prompt capped at
+ * MESSAGE_MAX, the count capped at SENTINEL_MAX_PROMPTS.
+ * @returns {string[]} the usable prompts ([] = nothing to run)
+ */
+export function sanitizeSentinelPrompts(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+      ? raw.split("\n")
+      : [];
+  const prompts = [];
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const t = item.trim();
+    if (!t) continue;
+    prompts.push(t.slice(0, MESSAGE_MAX));
+  }
+  return prompts.slice(0, SENTINEL_MAX_PROMPTS);
+}
+
+/**
+ * Create the sentinel record (pure).
+ * @param {string[]} prompts  sanitized, non-empty
+ * @param {number} now
+ */
+export function createSentinel(prompts, now) {
+  return {
+    queue: prompts.slice(),        // remaining prompts; front = next to send
+    total: prompts.length,         // original count (the "3/7" display)
+    sentCount: 0,                  // confirmed deliveries
+    startedAt: typeof now === "number" ? now : 0,
+  };
+}
+
+/**
+ * The next prompt a live sentinel would send (null when inactive).
+ * @returns {string|null}
+ */
+export function sentinelNextPrompt(session) {
+  const sen = session && session.sentinel;
+  if (!sen || typeof sen !== "object" || !Array.isArray(sen.queue)) return null;
+  if (sen.queue.length === 0) return null;
+  return typeof sen.queue[0] === "string" ? sen.queue[0] : null;
+}
+
+/**
+ * Progress label for events/notifications: the prompt ABOUT to be sent
+ * is sentCount+1 of total ("3/7").
+ * @returns {string}
+ */
+export function sentinelProgress(session) {
+  const sen = session && session.sentinel;
+  if (!sen || typeof sen !== "object") return "0/0";
+  const sent = typeof sen.sentCount === "number" ? sen.sentCount : 0;
+  const total = typeof sen.total === "number" ? sen.total : sen.queue ? sen.queue.length : 0;
+  return `${Math.min(sent + 1, Math.max(total, 1))}/${total}`;
+}
+
+/**
+ * Advance the runbook after a CONFIRMED delivery of `text` (mutates the
+ * record). A text that is not the queue head never consumes a prompt —
+ * a manual relaunch message must not eat the runbook.
+ * @returns {"advanced"|"complete"|"ignored"}
+ */
+export function advanceSentinel(session, text) {
+  const sen = session && session.sentinel;
+  if (!sen || typeof sen !== "object" || !Array.isArray(sen.queue)) return "ignored";
+  if (sen.queue.length === 0 || sen.queue[0] !== text) return "ignored";
+  sen.queue.shift();
+  sen.sentCount = (typeof sen.sentCount === "number" ? sen.sentCount : 0) + 1;
+  return sen.queue.length === 0 ? "complete" : "advanced";
 }
