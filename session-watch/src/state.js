@@ -7,7 +7,7 @@
  * and `tabId` is always just the current binding).
  */
 
-import { STATUS, SESSION_EVENT_RING, MAX_SESSIONS } from "./protocol.js";
+import { STATUS, SESSION_EVENT_RING, MAX_SESSIONS, NAME_MAX } from "./protocol.js";
 
 /**
  * Create a fresh armed session record.
@@ -23,6 +23,14 @@ export function createSessionRecord(input) {
     sessionId: typeof input.sessionId === "string" ? input.sessionId : "",
     tabId: typeof input.tabId === "number" ? input.tabId : -1,
     title: typeof input.title === "string" ? input.title : "",
+    // operator naming (v1.1): name beats titleHint beats title in the popup
+    name: "",                     // operator-set label ("" = derive from hint)
+    titleHint: "",                // first user message text (sensor-derived)
+    relaunchMessage: null,        // null = inherit global setting; "" = off; "text" = custom
+    pendingMessage: null,         // {text, reason, setAt, attempts} while a send is pending
+    // keep-going ladder (v1.1): when the composer was first seen free
+    idleSince: 0,                 // ts of the first turnOpen===false observation
+    lastMessageSentAt: 0,         // ts of our last successful relaunch message
     armed: true,
     auto: input.auto === true,
     armedAt: input.now,
@@ -62,7 +70,11 @@ export function pushSessionEvent(record, evt) {
   return record;
 }
 
-/** Reset every incident counter (a healthy observation). */
+/** Reset every incident counter (a healthy observation). NOTE: idleSince
+ *  is KEEP-GOING state, not an incident counter — zeroing it here would
+ *  reset the turn-end grace on every idle tick and the grace could never
+ *  elapse (caught by the E2E blocked-send scenario). It is cleared only
+ *  by an observed OPEN turn or an explicit clearIdle plan flag. */
 export function resetIncident(session) {
   session.consecutiveUnreachable = 0;
   session.unreachableReloads = 0;
@@ -77,6 +89,22 @@ export function resetIncident(session) {
 export function resetRelaunchBudget(session) {
   session.relaunchAttempts = 0;
   return session;
+}
+
+/**
+ * The display label for a session (operator v1.1): the operator-set name
+ * beats the first-user-message hint beats the short id. Used in every
+ * notification and the diagnostic dump so alerts are name-aware.
+ * @returns {string}
+ */
+export function labelOf(session) {
+  if (!session) return "?";
+  const name = typeof session.name === "string" ? session.name.trim() : "";
+  if (name) return name.slice(0, NAME_MAX);
+  const hint = typeof session.titleHint === "string" ? session.titleHint.trim() : "";
+  if (hint) return hint.slice(0, NAME_MAX);
+  const id = typeof session.sessionId === "string" ? session.sessionId : "";
+  return id.length > 8 ? id.slice(0, 8) : id || "?";
 }
 
 /**

@@ -2,3 +2,5 @@ build/
 dist/
 node_modules/
 *.log
+test/e2e/__pycache__/
+test/harness/__pycache__/

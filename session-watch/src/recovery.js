@@ -9,7 +9,7 @@
  */
 
 import { STATUS, classifyUrl } from "./protocol.js";
-import { resetIncident } from "./state.js";
+import { resetIncident, labelOf } from "./state.js";
 
 /** Typed plan action kinds. */
 export const ACTION = Object.freeze({
@@ -20,9 +20,33 @@ export const ACTION = Object.freeze({
   FRESH_TAB: "fresh-tab",       // close + create at the session URL (lesson 52/54)
   REOPEN: "reopen-tab",         // tab gone -> create at the session URL
   DISMISS: "dismiss-dialog",    // Cancel-only (operator rule)
+  SEND_MESSAGE: "send-message", // v1.1: type + send the relaunch message (keep-going)
   NOTIFY: "notify",
   EVENT_ONLY: "event-only",
 });
+
+/**
+ * Resolve the relaunch message for a session (operator v1.1):
+ *   session.relaunchMessage === null  -> the global settings default
+ *   session.relaunchMessage === ""    -> explicitly OFF for this session
+ *   session.relaunchMessage (text)    -> the per-session custom message
+ * @returns {string|null} the message to send, or null when none applies
+ */
+export function effectiveRelaunchMessage(session, settings) {
+  const own =
+    session && typeof session.relaunchMessage === "string"
+      ? session.relaunchMessage
+      : null;
+  if (own !== null) {
+    const t = own.trim();
+    return t.length > 0 ? t : null;
+  }
+  const global =
+    settings && typeof settings.relaunchMessage === "string"
+      ? settings.relaunchMessage.trim()
+      : "";
+  return global.length > 0 ? global : null;
+}
 
 /**
  * @typedef {Object} PlanInput
@@ -208,7 +232,7 @@ export function planAction(input) {
     const sinceMutation = now - (snapshot.lastMutationAt || 0);
     if (sinceMutation < freezeMs) {
       // DOM activity within the window: LIVE, reset the incident.
-      return plan(STATUS.LIVE, ACTION.EVENT_ONLY, "live", { resetIncident: true });
+      return plan(STATUS.LIVE, ACTION.EVENT_ONLY, "live", { resetIncident: true, resetBudget: true, clearIdle: true });
     }
     // DOM quiet — need the SERVER-side truth before any verdict.
     if (!serverProbe) {
@@ -260,6 +284,8 @@ export function planAction(input) {
         // worker works server-side (lesson 106).
         return plan(STATUS.LIVE, ACTION.EVENT_ONLY, "live-silent", {
           resetIncident: true,
+          resetBudget: true,
+          clearIdle: true,
           observeServer: serverProbe.updatedAt,
         });
       }
@@ -299,13 +325,107 @@ export function planAction(input) {
   }
 
   if (snapshot.turnOpen === false) {
-    // No open turn: a session waiting for input is NOT frozen.
-    return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "idle", { resetIncident: true });
+    // ── THE KEEP-GOING LADDER (v1.1 — operator 2026-10-14) ──────────
+    // A session whose turn ENDED while its task is unfinished looks,
+    // to the DOM, EXACTLY like a finished one (the composer simply comes
+    // back). v1.0.7 called this IDLE and did nothing — the live failure
+    // the operator reported: "it returned without finishing and the
+    // watcher didn't do anything to relaunch it." Now the idle state is
+    // interrogated: after a quiet grace window, the relaunch message is
+    // SENT (per-session override -> global default -> "continue").
+    return keepGoingPlan(input);
   }
 
   // turnOpen === null: unknown control shape — record only (fail-safe).
   return plan(session.status, ACTION.EVENT_ONLY, "unknown-turn-state", {
     events: [ev(now, "unknown", "turn state unknown (control locators matched nothing); no verdict")],
+  });
+}
+
+/**
+ * The KEEP-GOING ladder (DESIGN §7): the tab is on its session URL, the
+ * page answers, and the composer is free. Guards, in order:
+ *   1. a pending (in-flight/failed) send owns the retries while it lives
+ *   2. keep-going OFF (setting or empty resolved message) -> plain IDLE
+ *   3. a human draft in the composer -> IDLE, keep-going paused
+ *   4. within the quiet grace -> IDLE, waiting (idleSince tracked)
+ *   5. grace passed + budget -> SEND the relaunch message
+ *   6. grace passed + budget exhausted -> NEEDS_INPUT (siren + email)
+ */
+function keepGoingPlan(input) {
+  const { now, settings, session, snapshot } = input;
+  const graceMs = settings.turnEndGraceSeconds * 1000;
+
+  // 1. an unresolved pending send owns this window — no second queue
+  if (session.pendingMessage && typeof session.pendingMessage === "object") {
+    return plan(session.status, ACTION.EVENT_ONLY, "pending-send", {
+      events: [ev(now, "pending-send", "a relaunch message is pending; the flush owns the retries")],
+    });
+  }
+
+  // 2. keep-going disabled (setting off, or the resolved message is OFF)
+  const message = effectiveRelaunchMessage(session, settings);
+  if (settings.relaunchOnTurnEnd !== true || message === null) {
+    return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "idle", {
+      resetIncident: true,
+      clearIdle: true,
+      events: message === null && settings.relaunchOnTurnEnd === true
+        ? [ev(now, "keep-going-off", "relaunch message resolves to OFF for this session")]
+        : undefined,
+    });
+  }
+
+  // 3. a human draft: someone is typing — never clobber their text
+  if (snapshot.composerHasDraft === true) {
+    return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "draft-present", {
+      clearIdle: true,
+      events: [ev(now, "draft", "composer holds a draft (a human is typing); keep-going paused")],
+    });
+  }
+
+  // 4. the grace window: idleSince starts at the FIRST free-composer
+  // observation (transition-independent — survives SW restarts and
+  // missed edges, the exact shape of the live failure). The mutation
+  // clock is the snapshot's (the sensor's live fact), falling back to
+  // the record's last absorbed value.
+  const idleSince =
+    typeof session.idleSince === "number" && session.idleSince > 0
+      ? session.idleSince
+      : now;
+  const idleMs = now - idleSince;
+  const mutationAt =
+    typeof snapshot.lastMutationAt === "number"
+      ? snapshot.lastMutationAt
+      : session.lastMutationAt || 0;
+  const quietMs = now - mutationAt;
+  if (idleMs < graceMs || quietMs < graceMs) {
+    return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "idle-waiting", {
+      resetIncident: true,
+      setIdleSince: idleSince === now ? now : undefined,
+    });
+  }
+
+  // 5. grace passed — the turn ended and NOBODY came back: relaunch it
+  if ((session.relaunchAttempts || 0) < settings.relaunchCap) {
+    return plan(STATUS.RECOVERING, ACTION.SEND_MESSAGE, "turn-ended", {
+      relaunchAttempt: true,
+      sendMessage: message,
+      clearIdle: true,
+      notify: {
+        kind: "relaunched",
+        message: `Session ${labelOf(session)} returned without finishing — sending "${trimTo(message, 60)}"`,
+      },
+      events: [ev(now, "turn-end-send", `turn ended ${Math.round(idleMs / 1000)}s ago and stayed idle past the ${settings.turnEndGraceSeconds}s grace; sending the relaunch message`)],
+    });
+  }
+
+  // 6. budget exhausted: the sends did not reopen a turn — a human is needed
+  return plan(STATUS.NEEDS_INPUT, ACTION.EVENT_ONLY, "idle-budget", {
+    notify: {
+      kind: "needsInput",
+      message: `Session ${labelOf(session)} returned but ${settings.relaunchCap} relaunch ${settings.relaunchCap === 1 ? "message" : "messages"} failed to reopen the turn — it needs you`,
+    },
+    events: [ev(now, "needs-input", "relaunch budget exhausted on an idle turn; needs a human message")],
   });
 }
 
@@ -322,19 +442,30 @@ function returnedPlan(input) {
   if (serverProbe && serverProbe.ok === true) {
     if (serverProbe.exists) {
       if (session.relaunchAttempts < settings.relaunchCap) {
+        // The relaunch message (operator v1.1): "when it returns, relaunch
+        // it — but this time with a message I can customize." The message
+        // is queued on the session; the background sends it once the tab
+        // is back on the session URL and the composer is free (no open
+        // turn — never injected mid-generation).
+        const message = effectiveRelaunchMessage(session, settings);
         return plan(STATUS.RECOVERING, ACTION.NAVIGATE_BACK, "returned-alive", {
           relaunchAttempt: true,
+          sendMessage: message || undefined,
           notify: {
             kind: "relaunched",
-            message: `Session ${short(session.sessionId)} returned to the home page — taking it back`,
+            message: `Session ${labelOf(session)} returned to the home page — taking it back${
+              message ? " and sending your relaunch message" : ""
+            }`,
           },
-          events: [ev(now, "returned-relaunch", "tab rolled off the session URL; chat alive in the chats list; navigating back")],
+          events: [ev(now, "returned-relaunch", `tab rolled off the session URL; chat alive in the chats list; navigating back${
+            message ? "; relaunch message queued" : ""
+          }`)],
         });
       }
       return plan(STATUS.DEAD, ACTION.EVENT_ONLY, "returned-budget", {
         notify: {
           kind: "dead",
-          message: `Session ${short(session.sessionId)} keeps rolling home — marked DEAD`,
+          message: `Session ${labelOf(session)} keeps rolling home — marked DEAD`,
         },
         events: [ev(now, "dead", "returned repeatedly past the relaunch cap")],
       });

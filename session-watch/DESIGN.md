@@ -234,3 +234,68 @@ setting is validated + clamped on write (never trusted from storage).
 "Works perfectly" = every failure mode in §2 recovers (or reports, when
 the law forbids action) in the E2E run, with zero false positives on the
 live surface.
+
+## 8. The keep-going ladder (v1.1 — the 2026-10-14 live failure)
+
+The operator's live report: *"it returned without finishing and the watcher
+didn't do anything to relaunch it."* Post-mortem: a turn that dies mid-task
+(the provider's stream just ends — no error banner, the composer quietly
+re-enables) is DOM-identical to a finished turn. v1.0.7's ladder called
+that state IDLE — healthy by definition — and stayed silent. §3's ladder
+only knew two incidents: frozen OPEN turns and tabs that rolled home.
+
+**The v1.1 law: an idle composer on an armed session is a QUESTION, not a
+verdict.** After a quiet grace window the relaunch message is SENT
+(per-session override → global default → `"continue"`). The send is a
+bounded actuation, not a fact:
+
+- **Guards, in order** (recovery.js `keepGoingPlan`):
+  1. a pending (in-flight/failed) send owns the window — no double queue;
+  2. keep-going OFF (setting off, or the resolved message is "") → IDLE;
+  3. a human draft in the composer → IDLE, paused — we never clobber text;
+  4. inside the grace (`turnEndGraceSeconds`, default 90) → IDLE, waiting.
+- **Transition-independence**: `idleSince` is set at the FIRST observation
+  of a free composer, not at an observed generating→idle EDGE — a
+  service-worker restart or a throttled tab must never hide the incident
+  (the exact shape of the live failure). The DOM-mutation clock backs the
+  grace up: a mutating page (someone typing, something streaming) waits.
+- **The actuation** (content.js `sw-send-message`): re-checks turn-closed,
+  no-dialog, no-draft at send time; types React-safely (native value setter
+  + input event); clicks the observed send control; verifies the turn
+  actually opened; on a failed submit clears OUR text back out (a leftover
+  draft would stall the ladder). Never mid-generation, never through a
+  dialog, never over a captcha.
+- **The budget**: sends are counted; the budget resets ONLY on an observed
+  OPEN turn (LIVE) — productive continues are infinite by design, and a
+  blocked-send loop accumulates to the cap and terminates in
+  **NEEDS_INPUT** ("it needs a human"), with transport retries bounded
+  (3 attempts / 10 min TTL) by the pendingMessage record.
+- The RETURNED path (§4) queues the same message via `pendingMessage`
+  once the tab is back on its session URL — one queue, two entry points.
+
+## 9. The alert engine (v1.1 — "ring an alarm on my Ubuntu laptop")
+
+Kinds map to channels (protocol.js `ALARM_SIREN_KINDS` / `ALARM_CHIME_KINDS`):
+
+- **failure kinds** (dead, gone, wedged, frozen, auth, stalled,
+  humanVerification, needsInput) → OS notification (with a Silence button)
+  + a **looping synthesized siren** + email/webhook/ntfy, re-ringing every
+  `alarmRepeatMinutes` until a human acknowledges (or 30 min hard stop);
+- **relaunched** (the watchdog acted: turn-end send, return recovery…) →
+  a short chime + the same async channels.
+
+Laws: the engine never throws into the ladder (fire-and-forget, outcomes
+logged); the siren plays through a `chrome.offscreen` AUDIO_PLAYBACK
+document (Firefox: a visible flashing alarm tab with the same sound and a
+STOP button); email goes through the Brevo API with the operator's own key
+(stored locally, **redacted in every diagnostic export** — `src/diag.js`);
+ntfy.sh and a generic webhook are optional zero/low-setup push channels.
+
+## 10. Naming + diagnostics (v1.1)
+
+- `labelOf(session)`: operator name → first-user-message hint → short id.
+  Every notification, alarm banner and the popup is name-aware.
+- The diagnostic dump (`sw-export-diag` → popup "copy diagnostics"):
+  version, redacted settings, per-session verdicts/counters/pending
+  messages + bounded event trails, global events. Paste-ready for an
+  issue; secrets never leave the machine.

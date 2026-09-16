@@ -27,6 +27,11 @@
     </div>
   </header>
 
+  <div id="alarmBanner" class="sw-alarm-banner" hidden role="alert">
+    <span id="alarmBannerText">ALARM</span>
+    <button id="silenceAlarmBtn" class="sw-btn sw-btn-mini sw-btn-alarm-stop">Silence</button>
+  </div>
+
   <main id="mainView" class="sw-main">
     <section class="sw-section" aria-labelledby="sessionsHeading">
       <div class="sw-section-head">
@@ -84,7 +89,7 @@
           <input type="number" id="stallSeconds" min="300" max="21600" step="60" />
         </label>
         <label class="sw-field">
-          <span>Relaunch cap <em>(1–10 automatic relaunches per incident)</em></span>
+          <span>Relaunch cap <em>(1–10 failed relaunches before NEEDS INPUT)</em></span>
           <input type="number" id="relaunchCap" min="1" max="10" step="1" />
         </label>
         <div class="sw-switch-row">
@@ -129,26 +134,138 @@
         <p id="settingsSaved" class="sw-saved" hidden>saved</p>
       </form>
     </section>
+
+    <section class="sw-section" aria-labelledby="keepgoingHeading">
+      <div class="sw-section-head">
+        <h2 id="keepgoingHeading">Keep-going <em class="sw-section-note">(v1.1)</em></h2>
+      </div>
+      <form id="keepGoingForm" class="sw-form">
+        <p class="sw-form-note">
+          When a watched session's turn ends and the composer stays free
+          past the grace window, the watchdog sends the relaunch message —
+          a session that stops mid-task keeps going instead of sitting idle.
+        </p>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="relaunchOnTurnEnd" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Relaunch when a turn ends</span>
+          </label>
+        </div>
+        <label class="sw-field">
+          <span>Grace window <em>(30–600 s of quiet before the send — protects human drafts)</em></span>
+          <input type="number" id="turnEndGraceSeconds" min="30" max="600" step="10" />
+        </label>
+        <label class="sw-field">
+          <span>Relaunch message <em>(empty = never auto-send; each session can override)</em></span>
+          <textarea id="relaunchMessage" rows="2" maxlength="2000" placeholder="continue"></textarea>
+        </label>
+        <div class="sw-form-actions">
+          <button type="submit" class="sw-btn sw-btn-primary">Save keep-going</button>
+        </div>
+        <p id="keepGoingSaved" class="sw-saved" hidden>saved</p>
+      </form>
+    </section>
+
+    <section class="sw-section" aria-labelledby="alertsHeading">
+      <div class="sw-section-head">
+        <h2 id="alertsHeading">Alarms &amp; email <em class="sw-section-note">(v1.1)</em></h2>
+      </div>
+      <form id="alertsForm" class="sw-form">
+        <p class="sw-form-note">
+          A session that returns or fails to recover rings an alarm on this
+          machine and can email <span class="mono">team@payswap.org</span>.
+          Failures loop until silenced; relaunches chime once.
+        </p>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="alarmEnabled" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Alarm sound</span>
+          </label>
+        </div>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="alarmOnRelaunch" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Chime on relaunch <em>(the watchdog acted)</em></span>
+          </label>
+        </div>
+        <label class="sw-field">
+          <span>Re-ring unacknowledged sirens <em>(0–30 min, 0 = once)</em></span>
+          <input type="number" id="alarmRepeatMinutes" min="0" max="30" step="1" />
+        </label>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="emailEnabled" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Email alerts <em>(Brevo API)</em></span>
+          </label>
+        </div>
+        <label class="sw-field">
+          <span>To</span>
+          <input type="email" id="emailTo" placeholder="team@payswap.org" />
+        </label>
+        <label class="sw-field">
+          <span>From <em>(a Brevo-validated sender)</em></span>
+          <input type="email" id="emailFrom" placeholder="watchdog@payswap.org" />
+        </label>
+        <label class="sw-field">
+          <span>Brevo API key <em>(xkeysib-…; stored locally, redacted in exports)</em></span>
+          <input type="password" id="emailApiKey" autocomplete="off" placeholder="xkeysib-…" />
+        </label>
+        <label class="sw-field">
+          <span>ntfy topic <em>(optional zero-setup push — ntfy.sh/&lt;topic&gt;)</em></span>
+          <input type="text" id="ntfyTopic" placeholder="payswap-watchdog" />
+        </label>
+        <label class="sw-field">
+          <span>Webhook URL <em>(optional JSON POST)</em></span>
+          <input type="url" id="webhookUrl" placeholder="https://…" />
+        </label>
+        <div class="sw-form-actions">
+          <button type="submit" class="sw-btn sw-btn-primary">Save alerts</button>
+          <button type="button" id="testAlarmBtn" class="sw-btn">Test alarm</button>
+          <button type="button" id="testEmailBtn" class="sw-btn">Test email</button>
+        </div>
+        <p id="alertsSaved" class="sw-saved" hidden>saved</p>
+        <p id="alertsTestResult" class="sw-form-note" hidden></p>
+      </form>
+    </section>
   </main>
 
   <footer class="sw-footer">
     <span id="footerText">Session Watchdog</span>
     <span class="sw-spacer"></span>
+    <button id="copyDiagBtn" class="sw-link-btn" title="Copy a full diagnostics dump for bug reports">copy diagnostics</button>
     <a id="aboutLink" href="#" class="sw-link-btn">how it works</a>
   </footer>
 
   <dialog id="aboutDialog" class="sw-dialog">
     <h3>How the watchdog keeps sessions alive</h3>
     <ul class="sw-about-list">
+      <li><b>keep-going</b> — a session whose turn ends without finishing gets the relaunch message ("continue" or your own) after a quiet grace window; failed sends retry, then the status becomes NEEDS INPUT.</li>
       <li><b>freeze</b> — a turn that stops moving (DOM and server-side) is reloaded, then moved to a fresh tab.</li>
-      <li><b>return</b> — a tab that rolls back to the chat.z.ai home page is verified against the chats list and taken back to its session URL.</li>
+      <li><b>return</b> — a tab that rolls back to the chat.z.ai home page is verified against the chats list, taken back to its session URL, and sent the relaunch message.</li>
       <li><b>die</b> — a session destroyed server-side gets bounded relaunch attempts, then a DEAD flag with a notification.</li>
+      <li><b>alarms</b> — failures ring a looping siren (plus email / webhook / ntfy) until you silence them; relaunches chime once. Ubuntu: allow Chrome notifications in OS settings to hear the desk bell.</li>
       <li><b>popups</b> — capacity dialogs are dismissed with their Cancel button only; never their own suggestions, never captcha sliders.</li>
       <li><b>auth</b> — when the login dies you get a notification; signing in stays in your hands.</li>
       <li><b>queued</b> — sessions waiting for generation are left untouched (reloading them can wedge them).</li>
+      <li><b>diagnostics</b> — "copy diagnostics" in the footer produces a redacted, paste-ready dump (version, settings, per-session verdicts and events).</li>
     </ul>
     <form method="dialog">
       <button class="sw-btn sw-btn-primary">Close</button>
+    </form>
+  </dialog>
+
+  <dialog id="diagDialog" class="sw-dialog sw-dialog-wide">
+    <h3>Diagnostic dump</h3>
+    <p class="sw-form-note" id="diagStatus">Copy this block into the CTRL issue.</p>
+    <textarea id="diagText" class="sw-diag-text" readonly rows="14"></textarea>
+    <form method="dialog" class="sw-form-actions">
+      <button type="button" id="diagCopyBtn" class="sw-btn sw-btn-primary">Copy to clipboard</button>
+      <button type="button" id="diagDownloadBtn" class="sw-btn">Download .txt</button>
+      <button class="sw-btn">Close</button>
     </form>
   </dialog>
 

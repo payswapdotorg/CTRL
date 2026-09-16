@@ -162,6 +162,16 @@ def control(chat_id, action, arg=None):
     return json.load(urllib.request.urlopen(req, timeout=5))
 
 
+def harness_messages(chat_id):
+    """v1.1: every composer message the harness accepted for this chat."""
+    data = json.load(urllib.request.urlopen(f"{HARNESS}/audit", timeout=5))
+    return [
+        c.get("arg")
+        for c in data.get("controls", [])
+        if c.get("action") == "message" and c.get("chat") == chat_id
+    ]
+
+
 def new_chat(title):
     body = json.dumps({"title": title}).encode()
     req = urllib.request.Request(f"{HARNESS}/new", data=body, headers={"Content-Type": "application/json"})
@@ -221,8 +231,24 @@ class Popup:
         self.tab.ev(
             "(async()=>{return await new Promise(r=>chrome.runtime.sendMessage({evt:'sw-check-now'},r))})()",
             await_promise=True,
-            timeout=60,
+            timeout=90,
         )
+
+    def raw_send(self, msg, timeout=30):
+        return self.tab.ev(
+            f"(async()=>{{return await new Promise(r=>chrome.runtime.sendMessage({json.dumps(msg)},r))}})()",
+            await_promise=True,
+            timeout=timeout,
+        )
+
+    def update_session(self, session_url, patch):
+        return self.raw_send({"evt": "sw-update-session", "sessionUrl": session_url, **patch})
+
+    def export_diag(self):
+        return self.raw_send({"evt": "sw-export-diag"}, timeout=30)
+
+    def alarm_ack(self):
+        return self.raw_send({"evt": "sw-alarm-ack", "via": "e2e"})
 
     def popup_dom(self):
         return self.tab.ev(
@@ -259,6 +285,27 @@ def wait_for(fn, timeout_s=30, interval=1.0, desc="condition"):
     return None
 
 
+def pump_until(popup, pred, timeout_s=240, interval=6.0, settle=1.0):
+    """v1.1: drive check-now ticks while waiting — the keep-going ladder
+    needs ticks to advance (grace windows, send retries, budget)."""
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        try:
+            popup.check_now()
+        except Exception:
+            pass
+        time.sleep(settle)
+        try:
+            last = popup.state()
+        except Exception:
+            last = None
+        if last and pred(last):
+            return last
+        time.sleep(interval)
+    return last
+
+
 # ─────────────────────────── the suite ───────────────────────────
 
 
@@ -276,21 +323,39 @@ def main():
     log("popup open as a tab")
 
     # point the watchdog at the harness origin; freeze window at the
-    # clamp minimum (120s) so the quiet-clock scenarios run in minutes.
+    # clamp minimum (120s) so the quiet-clock scenarios run in minutes;
+    # the v1.1 keep-going grace at its clamp minimum (30s) likewise.
     # The first message after a cold SW start can drop — retry.
     r = None
     for attempt in range(5):
-        r = popup.settings({"providerOrigin": HARNESS, "tickSeconds": 30, "freezeSeconds": 120})
+        r = popup.settings({
+            "providerOrigin": HARNESS,
+            "tickSeconds": 30,
+            "freezeSeconds": 120,
+            "turnEndGraceSeconds": 30,
+            "relaunchCap": 2,
+        })
         if (r or {}).get("ok"):
             break
         log(f"  settings attempt {attempt + 1} got {r} — retrying")
         time.sleep(2)
     if not (r or {}).get("ok"):
         raise SystemExit(f"settings failed: {r}")
-    log(f"providerOrigin -> {HARNESS} (freeze window 120s)")
+    log(f"providerOrigin -> {HARNESS} (freeze 120s, turn-end grace 30s)")
     QUIET = 128  # freezeSeconds + margin
+    GRACE = 40   # turnEndGraceSeconds + margin
 
     st = popup.state()
+
+    # v1.1 hygiene: sessions from PREVIOUS runs (and the operator's real
+    # chat.z.ai tabs, orphaned the moment providerOrigin moved to the
+    # harness) would pollute this run and steal the alarm slot — forget
+    # everything not under the harness origin and silence any stale alarm.
+    stale = [s for s in (st.get("sessions") or []) if not (s.get("sessionUrl") or "").startswith(HARNESS)]
+    for s in stale:
+        popup.raw_send({"evt": "sw-remove-session", "sessionUrl": s.get("sessionUrl")})
+    popup.alarm_ack()
+    log(f"  cleaned {len(stale)} stale session(s) + acknowledged stale alarms")
 
     def fresh_session(title, mode=None):
         cid = new_chat(title)
@@ -326,7 +391,7 @@ def main():
     check("A5 popup chip reads LIVE", dom is True, popup.popup_dom())
 
     # ── B. IDLE ───────────────────────────────────────────────────
-    log("B. IDLE")
+    log("B. keep-going (turn ended, composer idle)")
     control(cid_a, "normal")
     tab_a.navigate(f"{HARNESS}/c/{cid_a}")  # reload the page into idle shape
     time.sleep(2.0)
@@ -334,7 +399,18 @@ def main():
     time.sleep(0.5)
     st = popup.state()
     sa = session_by_url(st, f"{HARNESS}/c/{cid_a}")
-    check("B1 status IDLE (no open turn)", bool(sa and sa.get("status") == "IDLE"), str((sa or {}).get("status")))
+    check("B1 status IDLE while inside the grace window", bool(sa and sa.get("status") == "IDLE"), str((sa or {}).get("status")))
+    log(f"  waiting out the turn-end grace ({GRACE}s)…")
+    time.sleep(GRACE)
+    popup.check_now()
+    time.sleep(1.0)
+    st = popup.state()
+    sa = session_by_url(st, f"{HARNESS}/c/{cid_a}")
+    check("B2 turn-end-send fired (the relaunch, not silence)", "turn-end-send" in events_of(sa), str(events_of(sa)))
+    msgs = harness_messages(cid_a)
+    check("B3 the relaunch message landed in the harness", any(t == "continue" for t in msgs), str(msgs))
+    check("B4 the turn reopened (no more idle)", (sa or {}).get("status") in ("LIVE", "RECOVERING"), str((sa or {}).get("status")))
+    control(cid_a, "normal")  # settle the chat for the next scenario
 
     # ── C. RETURN: tab bounces home, chat alive -> navigate back ──
     log("C. return")
@@ -498,6 +574,60 @@ def main():
     sk = session_by_url(st, f"{HARNESS}/c/{cid_k}")
     check("K2 recovered after un-wedge + reload", (sk or {}).get("status") in ("LIVE", "IDLE"), str((sk or {}).get("status")))
 
+    # ── L. KEEP-GOING failure: custom message, blocked send, ─────
+    #    NEEDS_INPUT, the alarm lifecycle, the diagnostics export ──
+    log("L. keep-going failure + alarm + diagnostics")
+    cid_l, tab_l, tid_l = fresh_session("worker-blocked")
+    time.sleep(2.0)
+    control(cid_l, "normal")
+    tab_l.navigate(f"{HARNESS}/c/{cid_l}")  # idle shape: the turn ended
+    time.sleep(2.0)
+
+    # name the session + set a custom relaunch message (operator v1.1)
+    lur = f"{HARNESS}/c/{cid_l}"
+    r = popup.update_session(lur, {"name": "night-shift", "relaunchMessage": "keep building v1.1"})
+    check("L1 session named + custom message saved", bool(r and r.get("ok") and r.get("session", {}).get("name") == "night-shift"), str(r))
+
+    # block the composer submit: every send lands nowhere — the exact
+    # "failed to recover" shape that must end in NEEDS_INPUT + alarm
+    control(cid_l, "block-send")
+
+    def _needs_input(st_):
+        s = session_by_url(st_ or {}, lur)
+        return bool(s and s.get("status") == "NEEDS_INPUT")
+
+    log("  pumping ticks through the blocked-send ladder (grace -> send -> grace -> send -> NEEDS_INPUT)…")
+    st = pump_until(popup, _needs_input, timeout_s=300, interval=5.0)
+    sl = session_by_url(st or {}, lur)
+    check("L2 NEEDS_INPUT verdict after the budget exhausted", bool(sl and sl.get("status") == "NEEDS_INPUT"), str((sl or {}).get("status")))
+    msgs = harness_messages(cid_l)
+    check("L3 the custom message was sent (not the default)", any(t == "keep building v1.1" for t in msgs), str(msgs))
+    evs = events_of(sl)
+    check("L4 turn-end sends + budget events recorded", "turn-end-send" in evs and "needs-input" in evs, str(evs))
+
+    # the alarm: active while unacknowledged, silent after the ack
+    st = popup.state()
+    ai = (st or {}).get("alarmInfo") or {}
+    check("L5 alarm active (siren, needsInput)", bool(ai.get("active") and ai.get("level") == "siren" and ai.get("kind") == "needsInput"), str(ai))
+    popup.alarm_ack()
+    time.sleep(0.5)
+    st = popup.state()
+    ai = (st or {}).get("alarmInfo") or {}
+    check("L6 alarm silenced by the ack", bool(not ai.get("active")), str(ai))
+
+    # the diagnostics export: version + name + verdict present, and the
+    # email API key NEVER leaves the machine
+    popup.settings({"emailApiKey": "xkeysib-SECRET123DO.NOTLEAK"})
+    d = popup.export_diag()
+    text = (d or {}).get("text") or ""
+    check("L7 diagnostics export answers", bool(d and d.get("ok") and len(text) > 400), str((d or {}).get("error", "")))
+    check("L8 diagnostics carry the name + verdict", "night-shift" in text and "NEEDS_INPUT" in text, text[:200])
+    check("L9 the API key is redacted", "SECRET123DO.NOTLEAK" not in text and "••" in text, "key leaked!")
+    popup.settings({"emailApiKey": ""})
+
+    control(cid_l, "unblock-send")
+    control(cid_l, "normal")
+
     # ── final: the badge + honest summary ─────────────────────────
     st = popup.state()
     total = len([s for s in st.get("sessions", []) if s.get("armed")])
@@ -511,7 +641,7 @@ def main():
 
     if not keep:
         popup.close()
-        cleanup_ids = [tid_e, tid_j, tid_k, find_tab_id_for_session(cid_a)]
+        cleanup_ids = [tid_e, tid_j, tid_k, tid_l, find_tab_id_for_session(cid_a)]
         cleanup_ids = [t for t in cleanup_ids if t and str(t) != str(tid_a)]
         cleanup_ids.append(tid_a)
         for tid in cleanup_ids:

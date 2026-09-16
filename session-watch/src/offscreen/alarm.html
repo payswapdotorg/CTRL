@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Session Watchdog — ALARM</title>
+  <style>
+    html, body { margin: 0; height: 100%; }
+    body {
+      font-family: system-ui, sans-serif;
+      display: grid;
+      place-items: center;
+      background: #7f1d1d;
+      color: #fff;
+      animation: flash 1s steps(2, start) infinite;
+    }
+    @keyframes flash { 50% { background: #450a0a; } }
+    .box {
+      max-width: 640px;
+      padding: 40px 48px;
+      text-align: center;
+      border-radius: 16px;
+      background: rgba(0, 0, 0, 0.35);
+    }
+    h1 { margin: 0 0 8px; font-size: 42px; letter-spacing: 2px; }
+    p { margin: 6px 0 24px; font-size: 18px; opacity: 0.95; }
+    button {
+      font-size: 22px;
+      padding: 14px 40px;
+      border-radius: 12px;
+      border: none;
+      cursor: pointer;
+      background: #fff;
+      color: #7f1d1d;
+      font-weight: 700;
+    }
+    button:hover { background: #fde68a; }
+    .hint { font-size: 13px; opacity: 0.7; margin-top: 18px; }
+    body.chime { background: #14532d; }
+    body.chime h1 { font-size: 30px; }
+    @media (prefers-reduced-motion: reduce) { body { animation: none; } }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1 id="title">⚠ SESSION WATCHDOG ALARM</h1>
+    <p id="detail">A watched session needs a human.</p>
+    <button id="stopBtn" type="button">Silence alarm</button>
+    <p class="hint" id="hint">The alarm keeps ringing until acknowledged.</p>
+  </div>
+  <script src="alarm.js"></script>
+</body>
+</html>

@@ -148,7 +148,7 @@ function manifestFor(variant, version) {
     name: "Session Watchdog",
     version,
     description:
-      "Watches chat.z.ai sessions and relaunches them when they freeze, return or die. Chrome, Opera and Firefox.",
+      "Watches chat.z.ai sessions and relaunches them when they freeze, return, die or stop mid-task. Chrome, Opera and Firefox.",
     action: {
       default_title: "Session Watchdog",
       default_popup: "popup/popup.html",
@@ -165,7 +165,10 @@ function manifestFor(variant, version) {
       "48": "icons/icon48.png",
       "128": "icons/icon128.png",
     },
-    permissions: ["storage", "tabs", "alarms", "notifications"],
+    // v1.1: clipboardWrite = the diagnostics copy button; offscreen (chrome
+    // only) = the looping alarm sound; notifications = the Ubuntu desktop
+    // alert surface + its Silence button
+    permissions: ["storage", "tabs", "alarms", "notifications", "clipboardWrite"],
     content_scripts: [
       {
         matches: ["https://chat.z.ai/*"],
@@ -176,21 +179,28 @@ function manifestFor(variant, version) {
   };
   if (variant === "chrome") {
     base.background = { service_worker: "background.js" };
-    base.host_permissions = ["https://chat.z.ai/*"];
+    base.permissions.push("offscreen");
+    // the alert endpoints (Brevo email + ntfy push) + optional webhooks
+    base.host_permissions = ["https://chat.z.ai/*", "https://api.brevo.com/*", "https://ntfy.sh/*"];
+    base.optional_host_permissions = ["http://*/*", "https://*/*"];
   } else if (variant === "firefox") {
     base.background = { scripts: ["background.js"] };
-    base.host_permissions = ["https://chat.z.ai/*"];
+    // Firefox has no chrome.offscreen — the alarm degrades to a visible
+    // alarm tab (src/offscreen/alarm.html) with the same sound + STOP.
+    base.host_permissions = ["https://chat.z.ai/*", "https://api.brevo.com/*", "https://ntfy.sh/*"];
     base.browser_specific_settings = {
       gecko: { id: "session-watchdog@payswap.org", strict_min_version: "109.0" },
     };
   } else if (variant === "test") {
     base.name = "Session Watchdog (test)";
     base.background = { service_worker: "background.js" };
+    base.permissions.push("offscreen");
     // BOTH origins: the harness for the E2E matrix, the REAL provider for
     // the live-surface validation pass. Which origin gets WATCHED is a
     // runtime setting (providerOrigin) — the matches only decide where
     // the sensor can run.
-    base.host_permissions = ["https://chat.z.ai/*", `${HARNESS_ORIGIN}/*`];
+    base.host_permissions = ["https://chat.z.ai/*", "https://api.brevo.com/*", "https://ntfy.sh/*", `${HARNESS_ORIGIN}/*`];
+    base.optional_host_permissions = ["http://*/*", "https://*/*"];
     base.content_scripts[0].matches = ["https://chat.z.ai/*", `${HARNESS_ORIGIN}/*`];
   } else {
     throw new Error(`unknown variant: ${variant}`);
@@ -207,12 +217,17 @@ function buildVariant(variant) {
   rmSync(out, { recursive: true, force: true });
   mkdirSync(join(out, "popup"), { recursive: true });
   mkdirSync(join(out, "icons"), { recursive: true });
+  mkdirSync(join(out, "offscreen"), { recursive: true });
 
   writeFileSync(join(out, "manifest.json"), JSON.stringify(manifestFor(variant, VERSION), null, 2));
   writeFileSync(join(out, "background.js"), bundle("background/background.js"));
   writeFileSync(join(out, "content.js"), bundle("content/content.js"));
   for (const f of ["popup.html", "popup.css", "popup.js"]) {
     copyFileSync(join(SRC, "popup", f), join(out, "popup", f));
+  }
+  // the alarm page: the chrome.offscreen document AND the Firefox alarm tab
+  for (const f of ["alarm.html", "alarm.js"]) {
+    copyFileSync(join(SRC, "offscreen", f), join(out, "offscreen", f));
   }
   for (const f of ["icon16.png", "icon32.png", "icon48.png", "icon128.png"]) {
     const icon = join(ROOT, "icons", f);

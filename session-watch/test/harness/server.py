@@ -64,6 +64,7 @@ class Chat:
         self.dialog = None  # dict(text=..., with_cancel=True) when on
         self.roll_to = None
         self.mutation_script = True
+        self.block_send = False  # v1.1: the composer submit goes nowhere
         # the message tree: a completed user+assistant pair, plus an open
         # assistant placeholder while a turn is generating/frozen.
         self.messages = {
@@ -109,10 +110,44 @@ class Chat:
         self.messages["m-user-2"]["childrenIds"] = [pid]
         self.placeholder_id = pid
 
+    def add_user_message(self, text: str):
+        """v1.1: an operator/watchdog message through the composer."""
+        mid = f"m-user-{len(self.messages) + 1}"
+        parent = (
+            self.placeholder_id
+            or max(
+                (m.get("timestamp", 0), k)
+                for k, m in self.messages.items()
+            )[1]
+        )
+        self.messages[mid] = {
+            "id": mid,
+            "role": "user",
+            "content": text,
+            "parentId": parent,
+            "childrenIds": [],
+            "timestamp": int(time.time() * 1000) % 10_000,
+        }
+        self.messages[parent]["childrenIds"] = [mid]
+
     def close_turn(self, content: str):
         if self.placeholder_id:
             self.messages[self.placeholder_id]["content"] = content
             self.placeholder_id = None
+
+    def add_user_message(self, text: str):
+        """v1.1: an operator/watchdog message through the composer."""
+        mid = f"m-user-{len(self.messages) + 1}"
+        parent = self.placeholder_id or "m-user-2"
+        self.messages[mid] = {
+            "id": mid,
+            "role": "user",
+            "content": text,
+            "parentId": parent,
+            "childrenIds": [],
+            "timestamp": int(time.time() * 1000) % 10_000,
+        }
+        self.messages[parent]["childrenIds"] = [mid]
 
     def touch(self):
         if not self.updated_frozen:
@@ -186,6 +221,23 @@ def apply_control(chat_id: str, action: str, arg=None):
                     m["content"] = None
             chat.updated_frozen = False
             chat.touch()
+        elif action == "message":
+            # v1.1: the composer submitted a message (the watchdog's
+            # keep-going send or a human). Opens a generating turn —
+            # unless the chat is in block-send mode (the send goes nowhere).
+            if chat.block_send:
+                return {"ok": False, "blocked": True}
+            chat.mode = "generating"
+            chat.mutation_script = True
+            chat.add_user_message(str(arg or ""))
+            chat.open_turn()
+            chat.dialog = None
+            chat.updated_frozen = False
+            chat.touch()
+        elif action == "block-send":
+            chat.block_send = True
+        elif action == "unblock-send":
+            chat.block_send = False
         elif action == "return":
             # one-shot: the next session-page load bounces home
             chat.mode = "returned"
@@ -273,6 +325,40 @@ PAGE = """<!DOCTYPE html>
     var token = "{token}";
     if (token) localStorage.setItem('token', token);
   }} catch (e) {{}}
+  var CHAT_ID = "{chat_id}";
+  // v1.1: the composer actually submits — a message POSTs to /control
+  // (audited), then the slot swaps to Stop and the user row renders.
+  // block-send chats answer {{blocked}} and NOTHING happens locally:
+  // the failed-send shape the keep-going ladder must survive.
+  var sendBtn = document.getElementById('send-message-button');
+  var input = document.getElementById('chat-input');
+  if (sendBtn && input) {{
+    sendBtn.addEventListener('click', function () {{
+      var text = (input.value || '').trim();
+      if (!text) return;
+      fetch('/control', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{chat: CHAT_ID, action: 'message', text: text}}),
+      }}).then(function (r) {{ return r.json(); }}).then(function (res) {{
+        if (!res || res.ok !== true) return; // blocked: nothing happens
+        var row = document.createElement('div');
+        row.className = 'row user-message';
+        row.textContent = text;
+        document.querySelector('main').appendChild(row);
+        var wrap = document.createElement('div');
+        wrap.setAttribute('data-tooltip-trigger');
+        wrap.setAttribute('aria-label', 'Stop');
+        var b = document.createElement('button');
+        b.id = 'stop-button';
+        b.setAttribute('aria-label', 'stop button');
+        b.textContent = '■';
+        wrap.appendChild(b);
+        sendBtn.replaceWith(wrap);
+        input.value = '';
+      }}).catch(function () {{}});
+    }});
+  }}
   {stream_block}
 }})();
 </script>
@@ -356,6 +442,7 @@ def render_page(chat: Chat) -> str:
         token=token,
         email_json=json.dumps(email),
         stream_block=stream,
+        chat_id=chat.id,
     )
 
 
@@ -384,6 +471,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             self._json(200, {"ok": True, "chats": len(CHATS)})
+            return
+
+        if path == "/audit":
+            # v1.1: the control audit trail (messages included) — the
+            # E2E asserts the watchdog's sends actually landed
+            with LOCK:
+                self._json(200, {"ok": True, "controls": CONTROLS[-80:]})
             return
 
         if path == "/api/v1/chats/list":
@@ -489,7 +583,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"{}")
             chat_id = body.get("chat")
             action = body.get("action")
-            arg = body.get("arg")
+            # the session PAGE posts composer messages as {text}; the E2E
+            # posts control actions as {arg} — accept both
+            arg = body.get("arg", body.get("text"))
             if not chat_id or not action:
                 self._json(400, {"ok": False, "error": "chat+action required"})
                 return

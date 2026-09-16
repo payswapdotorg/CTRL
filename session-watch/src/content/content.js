@@ -13,6 +13,11 @@
  *                                    chat detail for the placeholder fact
  *   {cmd: "sw-dismiss-dialog"}    -> clicks ONLY a cancel-vocabulary control
  *                                    inside the topmost visible dialog
+ *   {cmd: "sw-send-message", text} -> v1.1 keep-going actuation: types the
+ *                                    relaunch message into the FREE composer
+ *                                    and submits it (never mid-turn, never
+ *                                    over a human draft, never through a
+ *                                    dialog) — then verifies the turn opened
  *
  *   announce "sw-content-ready" + snapshot on every page load.
  *
@@ -42,6 +47,7 @@
     SNAPSHOT: "sw-snapshot",
     SERVER_PROBE: "sw-server-probe",
     DISMISS_DIALOG: "sw-dismiss-dialog",
+    SEND_MESSAGE: "sw-send-message",
   };
 
   // CTRL-014 ZAI_LOCATORS — LIVE-OBSERVED on the real provider surface
@@ -207,14 +213,43 @@
     return m ? m[1] : null;
   }
 
+  /** The composer's current text (textarea/input or contenteditable). */
+  function composerText(el) {
+    if (!el) return "";
+    try {
+      if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        return String(el.value || "");
+      }
+      return String(el.textContent || el.innerText || "");
+    } catch {
+      return "";
+    }
+  }
+
+  /** Best-effort first user message text (the naming hint, v1.1). */
+  function readTitleHint() {
+    for (const sel of LOC.userMessage) {
+      const hits = queryAll(sel).filter(visible);
+      if (hits.length > 0) {
+        const t = (hits[0].textContent || "").trim().replace(/\s+/g, " ");
+        return t.slice(0, 80);
+      }
+    }
+    return null;
+  }
+
   function buildSnapshot() {
     const dialog = readDialog();
+    const composer = firstVisible(LOC.composer);
+    const draft = composer ? composerText(composer).trim().length > 0 : null;
     return {
       ok: true,
       sessionId: sessionIdFromLocation(),
       url: window.location.href,
       turnOpen: readTurnOpen(),
       lastMutationAt,
+      composerHasDraft: draft,
+      titleHint: readTitleHint(),
       dialog,
       humanVerification: queryAll(LOC.humanVerificationPopup).filter(visible).length > 0,
       auth: readAuth(),
@@ -316,6 +351,121 @@
     }
   }
 
+  /* ─────────────── the keep-going actuation (v1.1) ─────────────── */
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * Type `text` into the composer and submit it. LAWS (DESIGN §7):
+   *   - only into a FREE composer (turnOpen must be false NOW, re-checked
+   *     at send time — never inject mid-generation);
+   *   - never over a human draft (abort, report draft-present);
+   *   - never while a dialog or captcha is up;
+   *   - React-safe typing (native value setter + input event), Enter-safe
+   *     fallback, click on the observed send control;
+   *   - verify the turn actually opened; on a failed submit, clear our
+   *     own text back out (a lingering draft would stall the ladder).
+   */
+  async function sendMessageToComposer(text) {
+    if (typeof text !== "string" || !text.trim()) {
+      return { ok: false, error: "empty-text" };
+    }
+    const bounded = text.slice(0, 2000);
+
+    if (readDialog().present) return { ok: false, error: "dialog-present" };
+    if (queryAll(LOC.humanVerificationPopup).filter(visible).length > 0) {
+      return { ok: false, error: "human-verification" };
+    }
+    if (readTurnOpen() === true) return { ok: false, error: "turn-open" };
+
+    const composer = firstVisible(LOC.composer);
+    if (!composer) return { ok: false, error: "no-composer" };
+    if (composerText(composer).trim().length > 0) {
+      return { ok: false, error: "draft-present" };
+    }
+
+    // type (React-safe for inputs/textareas; execCommand for contenteditable)
+    const isInput =
+      composer.tagName === "TEXTAREA" || composer.tagName === "INPUT";
+    try {
+      if (isInput) {
+        const proto =
+          composer.tagName === "TEXTAREA"
+            ? window.HTMLTextAreaElement && HTMLTextAreaElement.prototype
+            : window.HTMLInputElement && HTMLInputElement.prototype;
+        const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc && desc.set) desc.set.call(composer, bounded);
+        else composer.value = bounded;
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        composer.focus();
+        document.execCommand("insertText", false, bounded);
+      }
+    } catch (e) {
+      return { ok: false, error: "type-failed: " + String((e && e.message) || e) };
+    }
+
+    await sleep(200); // let React state settle + the send control enable
+
+    const send = firstVisible(LOC.send);
+    if (!send) return { ok: false, error: "no-send-control", typed: true };
+    const disabled =
+      send.disabled === true || send.getAttribute("aria-disabled") === "true";
+    if (disabled) return { ok: false, error: "send-disabled", typed: true };
+
+    let clicked = false;
+    try {
+      send.click();
+      clicked = true;
+    } catch {
+      /* fall through to the Enter fallback */
+    }
+
+    // verify the turn opened (the Stop family appears); Enter fallback once
+    for (let i = 0; i < 10; i++) {
+      await sleep(250);
+      const open = readTurnOpen();
+      if (open === true) {
+        return { ok: true, sent: true, verified: true, clicked };
+      }
+      if (open === null && i === 4 && clicked) {
+        try {
+          composer.dispatchEvent(
+            new KeyboardEvent("keydown", {
+              key: "Enter",
+              code: "Enter",
+              keyCode: 13,
+              bubbles: true,
+              cancelable: true,
+            })
+          );
+        } catch {
+          /* verification only — never fatal */
+        }
+      }
+    }
+
+    // the click landed but no turn was observed: clear our text back out
+    // so the leftover draft cannot stall the keep-going ladder
+    try {
+      if (isInput) {
+        const proto =
+          composer.tagName === "TEXTAREA"
+            ? window.HTMLTextAreaElement && HTMLTextAreaElement.prototype
+            : window.HTMLInputElement && HTMLInputElement.prototype;
+        const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc && desc.set) desc.set.call(composer, "");
+        else composer.value = "";
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+      } else if (composerText(composer).trim() === bounded.trim()) {
+        composer.textContent = "";
+      }
+    } catch {
+      /* best-effort cleanup */
+    }
+    return { ok: true, sent: true, verified: false, clicked, error: "turn-not-observed", cleared: true };
+  }
+
   /* ─────────────── the bounded dismissal (Cancel only) ─────────────── */
 
   function dismissDialog() {
@@ -382,6 +532,11 @@
       case CMD.DISMISS_DIALOG:
         sendResponse(dismissDialog());
         return;
+      case CMD.SEND_MESSAGE:
+        sendMessageToComposer(msg.text)
+          .then((r) => sendResponse(r))
+          .catch((e) => sendResponse({ ok: false, error: String(e) }));
+        return true; // async
       default:
         return;
     }

@@ -10,7 +10,7 @@
 export const STATUS = Object.freeze({
   WATCHING: "WATCHING",       // armed, no facts yet
   LIVE: "LIVE",               // open turn + recent activity
-  IDLE: "IDLE",               // no open turn, page answers
+  IDLE: "IDLE",               // no open turn, page answers (keep-going may fire)
   FROZEN: "FROZEN",           // freeze verdict; recovery exhausted or pending
   RECOVERING: "RECOVERING",   // a recovery action is in flight / just taken
   RETURNED: "RETURNED",       // tab rolled off the session URL
@@ -20,6 +20,7 @@ export const STATUS = Object.freeze({
   AUTH_REQUIRED: "AUTH_REQUIRED",
   GONE: "GONE",               // tab closed and not reopened (setting/budget)
   WEDGED: "WEDGED",           // content channel unreachable, budget exhausted
+  NEEDS_INPUT: "NEEDS_INPUT", // v1.1: idle turn, relaunch budget exhausted — it needs a human
 });
 
 /** Commands background -> content sensor. */
@@ -27,6 +28,7 @@ export const CMD = Object.freeze({
   SNAPSHOT: "sw-snapshot",
   SERVER_PROBE: "sw-server-probe",
   DISMISS_DIALOG: "sw-dismiss-dialog",
+  SEND_MESSAGE: "sw-send-message", // the relaunch message (return recovery)
 });
 
 /** Events content -> background / popup -> background. */
@@ -39,6 +41,11 @@ export const EVT = Object.freeze({
   RELAUNCH_NOW: "sw-relaunch-now",
   REMOVE_SESSION: "sw-remove-session",
   CHECK_NOW: "sw-check-now",
+  UPDATE_SESSION: "sw-update-session",     // name / relaunch-message edits
+  EXPORT_DIAG: "sw-export-diag",            // the copy-paste diagnostics dump
+  ALARM_ACK: "sw-alarm-ack",               // silence the active alarm
+  ALARM_TEST: "sw-alarm-test",             // ring the alarm once (settings)
+  EMAIL_TEST: "sw-email-test",             // send a test email (settings)
 });
 
 /** The provider origin (the shipped surface). */
@@ -52,19 +59,46 @@ export const KEYS = Object.freeze({
   SETTINGS: "watchdog.settings",
   SESSIONS: "watchdog.sessions",
   EVENTS: "watchdog.events",
+  DIAG: "watchdog.diag",
 });
 
 /** Alarm names. */
 export const ALARMS = Object.freeze({
   TICK: "watchdog-tick",
+  REPEAT: "watchdog-alarm-repeat", // re-rings an unacknowledged alarm
 });
 
 /** Per-session event ring bound. */
 export const SESSION_EVENT_RING = 50;
 /** Global event ring bound. */
 export const GLOBAL_EVENT_RING = 200;
+/** Diagnostic ring bound (the debug export source). */
+export const DIAG_RING = 500;
 /** Max sessions tracked (bounded by design). */
 export const MAX_SESSIONS = 64;
+/** Per-session name bound. */
+export const NAME_MAX = 80;
+/** Relaunch-message bound (global default and per-session override). */
+export const MESSAGE_MAX = 2000;
+/** A pending relaunch message expires after this (ms). */
+export const PENDING_MESSAGE_TTL_MS = 10 * 60 * 1000;
+/** Send attempts before a pending message is dropped. */
+export const PENDING_MESSAGE_ATTEMPTS = 3;
+/** The alarm hard-stops after this (ms) even if never acknowledged. */
+export const ALARM_HARD_STOP_MS = 30 * 60 * 1000;
+
+/** Notification kinds that ring the LOOPING SIREN (needs a human). */
+export const ALARM_SIREN_KINDS = Object.freeze([
+  "dead", "gone", "wedged", "frozen", "auth", "stalled",
+  "humanVerification", "needsInput",
+]);
+/** Notification kinds that ring the SHORT CHIME (the watchdog acted). */
+export const ALARM_CHIME_KINDS = Object.freeze(["relaunched"]);
+/** Email/alert endpoint hosts (manifest host_permissions). */
+export const ALERT_HOSTS = Object.freeze([
+  "https://api.brevo.com/*",
+  "https://ntfy.sh/*",
+]);
 
 /**
  * Default settings (clamped by normalizeSettings on every read/write).
@@ -82,6 +116,21 @@ export const DEFAULT_SETTINGS = Object.freeze({
   dismissPopups: true,         // Cancel-only dialog dismissal (operator rule)
   notify: true,
   providerOrigin: PROVIDER_ORIGIN, // /c/<id> grammar holder (default: chat.z.ai)
+  // ── v1.1: the keep-going ladder (operator 2026-10-14: a session that
+  // returns without finishing gets a message, never silence) ──
+  relaunchMessage: "continue",     // the default message ("" = never auto-send)
+  relaunchOnTurnEnd: true,         // send it when a turn ends and stays idle
+  turnEndGraceSeconds: 90,         // quiet window before the send (draft guard)
+  // ── v1.1: the alarm + email channel (operator 2026-10-14) ──
+  alarmEnabled: true,              // master switch for sound
+  alarmOnRelaunch: true,           // chime when the watchdog relaunches
+  alarmRepeatMinutes: 2,           // re-ring an unacknowledged siren (0 = off)
+  emailEnabled: false,             // Brevo API email to the team
+  emailApiKey: "",                 // Brevo API key (stored locally, redacted in exports)
+  emailTo: "team@payswap.org",     // the operator's team inbox
+  emailFrom: "watchdog@payswap.org", // a Brevo-validated sender
+  webhookUrl: "",                  // optional generic JSON webhook
+  ntfyTopic: "",                   // optional ntfy.sh topic (push, zero setup)
 });
 
 /** Clamp helpers. */
@@ -103,6 +152,14 @@ function clampUrl(v, dflt) {
     return dflt;
   }
 }
+function clampStr(v, dflt, max) {
+  if (typeof v !== "string") return dflt;
+  return v.slice(0, max);
+}
+function clampTopic(v) {
+  if (typeof v !== "string") return "";
+  return v.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 100);
+}
 
 /**
  * Validate + clamp a settings object (never trust storage).
@@ -123,6 +180,18 @@ export function normalizeSettings(raw) {
     dismissPopups: clampBool(s.dismissPopups, d.dismissPopups),
     notify: clampBool(s.notify, d.notify),
     providerOrigin: clampUrl(s.providerOrigin, d.providerOrigin),
+    relaunchMessage: clampStr(s.relaunchMessage, d.relaunchMessage, MESSAGE_MAX),
+    relaunchOnTurnEnd: clampBool(s.relaunchOnTurnEnd, d.relaunchOnTurnEnd),
+    turnEndGraceSeconds: clampInt(s.turnEndGraceSeconds, d.turnEndGraceSeconds, 30, 600),
+    alarmEnabled: clampBool(s.alarmEnabled, d.alarmEnabled),
+    alarmOnRelaunch: clampBool(s.alarmOnRelaunch, d.alarmOnRelaunch),
+    alarmRepeatMinutes: clampInt(s.alarmRepeatMinutes, d.alarmRepeatMinutes, 0, 30),
+    emailEnabled: clampBool(s.emailEnabled, d.emailEnabled),
+    emailApiKey: clampStr(s.emailApiKey, d.emailApiKey, 200),
+    emailTo: clampStr(s.emailTo, d.emailTo, 200),
+    emailFrom: clampStr(s.emailFrom, d.emailFrom, 200),
+    webhookUrl: clampStr(s.webhookUrl, d.webhookUrl, 500),
+    ntfyTopic: clampTopic(s.ntfyTopic),
   };
 }
 
@@ -171,4 +240,5 @@ export const NOTIFY_COOLDOWN_MS = Object.freeze({
   wedged: 30 * 60 * 1000,
   humanVerification: 30 * 60 * 1000,
   gone: 30 * 60 * 1000,
+  needsInput: 15 * 60 * 1000,
 });
