@@ -1,0 +1,11 @@
+{
+  "name": "session-watchdog",
+  "private": true,
+  "version": "1.0.7",
+  "type": "module",
+  "description": "The chat.z.ai session watchdog — watches sessions, relaunches them when they freeze or return. Chrome / Opera / Firefox.",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/unit/"
+  }
+}

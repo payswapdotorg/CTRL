@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Session Watchdog</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="sw-header">
+    <div class="sw-header-row">
+      <div class="sw-title">
+        <span class="sw-logo" aria-hidden="true"></span>
+        <span>Session Watchdog</span>
+      </div>
+      <button id="settingsBtn" class="sw-icon-btn" title="Settings" aria-label="Open settings">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+    </div>
+    <div id="summaryRow" class="sw-summary">
+      <span id="summaryText">loading…</span>
+      <span class="sw-spacer"></span>
+      <button id="checkNowBtn" class="sw-link-btn" title="Run a check now">check now</button>
+    </div>
+  </header>
+
+  <main id="mainView" class="sw-main">
+    <section class="sw-section" aria-labelledby="sessionsHeading">
+      <div class="sw-section-head">
+        <h2 id="sessionsHeading">Watched sessions</h2>
+        <span id="sessionCount" class="sw-count">0</span>
+      </div>
+      <div id="sessionList" class="sw-session-list" role="list">
+        <div class="sw-empty" id="sessionEmpty">
+          No sessions connected yet.<br />
+          Open a <span class="mono">chat.z.ai/c/…</span> tab — it connects
+          automatically — or connect an open tab below.
+        </div>
+      </div>
+    </section>
+
+    <section class="sw-section" aria-labelledby="connectHeading">
+      <div class="sw-section-head">
+        <h2 id="connectHeading">Open chat tabs</h2>
+      </div>
+      <div id="tabList" class="sw-tab-list"></div>
+      <div class="sw-empty sw-empty-slim" id="tabEmpty" hidden>
+        No open chat.z.ai tabs.
+      </div>
+    </section>
+
+    <section class="sw-section" aria-labelledby="logHeading">
+      <div class="sw-section-head">
+        <h2 id="logHeading">Event log</h2>
+        <button id="toggleLogBtn" class="sw-link-btn" aria-expanded="false">show</button>
+      </div>
+      <div id="eventLog" class="sw-event-log" hidden></div>
+    </section>
+  </main>
+
+  <main id="settingsView" class="sw-main" hidden>
+    <section class="sw-section" aria-labelledby="behaviorHeading">
+      <div class="sw-section-head">
+        <h2 id="behaviorHeading">Behavior</h2>
+      </div>
+      <form id="settingsForm" class="sw-form">
+        <label class="sw-field">
+          <span>Check cadence <em>(30–600 s)</em></span>
+          <input type="number" id="tickSeconds" min="30" max="600" step="10" />
+        </label>
+        <label class="sw-field">
+          <span>Freeze window <em>(120–3600 s of silence before a freeze verdict)</em></span>
+          <input type="number" id="freezeSeconds" min="120" max="3600" step="30" />
+        </label>
+        <label class="sw-field">
+          <span>Unreachable threshold <em>(2–10 silent checks before a reload)</em></span>
+          <input type="number" id="unreachableThreshold" min="2" max="10" step="1" />
+        </label>
+        <label class="sw-field">
+          <span>Queued-stall window <em>(300–21600 s before a queued session is flagged)</em></span>
+          <input type="number" id="stallSeconds" min="300" max="21600" step="60" />
+        </label>
+        <label class="sw-field">
+          <span>Relaunch cap <em>(1–10 automatic relaunches per incident)</em></span>
+          <input type="number" id="relaunchCap" min="1" max="10" step="1" />
+        </label>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="swEnabled" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Watchdog enabled</span>
+          </label>
+        </div>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="autoWatch" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Auto-connect session tabs</span>
+          </label>
+        </div>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="relaunchOnTabClose" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Reopen closed session tabs</span>
+          </label>
+        </div>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="dismissPopups" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Dismiss popups <em>(Cancel only)</em></span>
+          </label>
+        </div>
+        <div class="sw-switch-row">
+          <label class="sw-switch">
+            <input type="checkbox" id="notify" />
+            <span class="sw-switch-track" aria-hidden="true"></span>
+            <span class="sw-switch-label">Desktop notifications</span>
+          </label>
+        </div>
+        <div class="sw-form-actions">
+          <button type="submit" class="sw-btn sw-btn-primary">Save settings</button>
+          <button type="button" id="resetSettingsBtn" class="sw-btn">Reset defaults</button>
+        </div>
+        <p id="settingsSaved" class="sw-saved" hidden>saved</p>
+      </form>
+    </section>
+  </main>
+
+  <footer class="sw-footer">
+    <span id="footerText">Session Watchdog</span>
+    <span class="sw-spacer"></span>
+    <a id="aboutLink" href="#" class="sw-link-btn">how it works</a>
+  </footer>
+
+  <dialog id="aboutDialog" class="sw-dialog">
+    <h3>How the watchdog keeps sessions alive</h3>
+    <ul class="sw-about-list">
+      <li><b>freeze</b> — a turn that stops moving (DOM and server-side) is reloaded, then moved to a fresh tab.</li>
+      <li><b>return</b> — a tab that rolls back to the chat.z.ai home page is verified against the chats list and taken back to its session URL.</li>
+      <li><b>die</b> — a session destroyed server-side gets bounded relaunch attempts, then a DEAD flag with a notification.</li>
+      <li><b>popups</b> — capacity dialogs are dismissed with their Cancel button only; never their own suggestions, never captcha sliders.</li>
+      <li><b>auth</b> — when the login dies you get a notification; signing in stays in your hands.</li>
+      <li><b>queued</b> — sessions waiting for generation are left untouched (reloading them can wedge them).</li>
+    </ul>
+    <form method="dialog">
+      <button class="sw-btn sw-btn-primary">Close</button>
+    </form>
+  </dialog>
+
+  <script src="popup.js"></script>
+</body>
+</html>
