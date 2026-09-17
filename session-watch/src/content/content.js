@@ -238,6 +238,20 @@
     return null;
   }
 
+  /**
+   * The LAST assistant reply text (v1.3 — the loop's Yes sensor).
+   * Reads the rendered transcript rows (never the API): the newest
+   * visible .chat-assistant row, whitespace-collapsed, capped at 400
+   * chars. Degrades to null when no row matches — a rotted selector
+   * loses the Yes signal, it can never manufacture one.
+   */
+  function readLastAssistantText() {
+    const rows = queryAll(LOC.assistantRow).filter(visible);
+    if (rows.length === 0) return null;
+    const t = (rows[rows.length - 1].textContent || "").trim().replace(/\s+/g, " ");
+    return t.slice(0, 400) || null;
+  }
+
   function buildSnapshot() {
     const dialog = readDialog();
     const composer = firstVisible(LOC.composer);
@@ -250,6 +264,7 @@
       lastMutationAt,
       composerHasDraft: draft,
       titleHint: readTitleHint(),
+      lastAssistantText: readLastAssistantText(),
       dialog,
       humanVerification: queryAll(LOC.humanVerificationPopup).filter(visible).length > 0,
       auth: readAuth(),

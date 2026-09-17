@@ -230,6 +230,23 @@ setting is validated + clamped on write (never trusted from storage).
    tab, CTRL-014 lesson 50/72 style), triggers every harness failure mode,
    and asserts the watchdog's recovery end-to-end. A final pass runs the
    sensor against the real authenticated `https://chat.z.ai` surface.
+   Three replay-Chrome lessons are encoded in the suite itself:
+   - *the stale worker* (Sep 17): a persisted unpacked registration can
+     serve a STALE service-worker SCRIPT from the profile's script cache
+     after a rebuild — v1.3 files on disk, v1.2 code live, "no-prompts".
+     The manifest cannot see this (re-read from disk at every boot), so
+     the bundled worker carries `SW_BUILD` (injected by build.mjs from
+     package.json), exposed as `swBuild` in `sw-get-state`; the suite
+     REFUSES to run unless swBuild equals the built version. (A
+     chrome.runtime.reload() from CDP was tried as a self-heal and
+     half-broke the registration — the Chrome 151 class; the loud
+     failure with the profile-cache fix is the honest repair.)
+   - *the wrong extension* (Sep 17): Chrome's built-in glic extension
+     also runs a background.js — a candidate id is only OURS when its
+     popup page carries the "Session Watchdog" title.
+   - *the half-registered load* (Chrome 151): `--load-extension` alone
+     is unreliable; the CDP `Extensions.loadUnpacked` fallback (armed by
+     `--enable-unsafe-extension-automation`) is deterministic.
 
 "Works perfectly" = every failure mode in §2 recovers (or reports, when
 the law forbids action) in the E2E run, with zero false positives on the
@@ -349,3 +366,64 @@ prompt per line — the exact shape the E2E drives) with a live
 carries the runbook position; `sw-sentinel-start` / `sw-sentinel-stop`
 are the typed popup→background events. A fresh runbook supersedes any
 stale pending send and opens a fresh budget.
+
+## 12. The keep-going loop (v1.3 — the Yes termination)
+
+The operator's words: *"the sentinel should receive keep a session going
+by sending in a custom prompt + a request for the session to reply with
+a short Yes message in case the entirety of the roadmap is implemented.
+if it receives a simple Yes then it should stop, otherwise it keeps
+sending in the custom prompt."* The runbook answers "what do I do next?"
+with a LIST. The loop answers "when is the work DONE?" — it is
+poll-until-complete: one custom prompt, re-sent every turn, for as long
+as the roadmap is unfinished; the session itself signals completion.
+
+**The message** (state.js `sentinelLoopMessage`, pure): every send is
+`<custom prompt>\n\n` + `SENTINEL_YES_REQUEST` — *"If the entirety of
+the roadmap is implemented, reply with just "Yes" and nothing else."*
+The request rides EVERY send, so the stop condition is always in play.
+`sanitizeSentinelPrompt` caps the custom part at
+`SENTINEL_LOOP_PROMPT_MAX` so prompt + request always fits MESSAGE_MAX.
+
+**The record**: `session.sentinel` gains `mode: "loop"` with a
+one-element queue that NEVER drains (`createSentinelLoop`) — only three
+things end a loop: the simple Yes, the operator's stop, or an exhausted
+budget. `sentCount` becomes the live "N sent" display; `prompt` keeps
+the operator's original text (diagnostics + notifications quote it, not
+the padded message). Old v1.2 records (no `mode`) keep runbook
+semantics — the regression is unit-pinned.
+
+**THE SIMPLE YES** (`isSimpleYes`, pure): strictly the word "yes"
+(case-insensitive) alone, wrapped at most in whitespace, sentence
+punctuation or rendered-markdown emphasis ("Yes.", " **yes** ", "YES!").
+A hard cap of 24 chars makes "simple" structural, not heuristic:
+"Yes, and here is the full summary…" is NOT the Yes. Anything else —
+including `null`/unknown (a rotted selector can LOSE the Yes signal but
+can never MANUFACTURE one) — keeps the loop going. The sensor is the
+content script's `readLastAssistantText`: the newest rendered assistant
+row, whitespace-collapsed, capped at 400 chars — the same ground-truth
+transcript reading as every other fact, never an API call.
+
+**The ladder** (recovery.js `sentinelPlan`, step 0 — BEFORE every
+guard): if `sentCount >= 1` (the Yes must ANSWER OUR PROMPT — a stale
+pre-arm "Yes" in the transcript never stops a fresh loop) and the last
+assistant text IS a simple Yes → the plan is `sentinel-yes`: the loop
+completes, the record clears, a "sentinel" chime + notification
+announces "replied a simple Yes — the roadmap is complete (N prompts
+delivered)". The check is a PURE READ (no actuation), so it fires even
+over a human draft — nothing is sent, so nothing can be clobbered.
+Afterwards the normal ladder keeps watching the final turn. Everything
+else is the runbook law unchanged: draft-pause, one grace clock, the
+bounded budget with turn-open resets (productive loops are infinite),
+NEEDS_INPUT keeps the loop INTACT for a manual-resume, the queue rides
+storage across restarts and rolls, and the loop message rides the
+RETURNED navigate-back the same way.
+
+**The surfaces**: the popup's "sentinel…" editor gains a mode select —
+*runbook (one per turn)* | *keep-going loop (until a Yes)* — the loop
+showing a single-line prompt input + the fixed Yes-request hint; the
+armed card reads `▸ sentinel loop · 3 sent · waiting for a simple Yes`;
+the diagnostics dump carries the LOOP line (sends + the prompt);
+`sw-sentinel-start` with `mode:"loop"` + `prompt` arms it,
+`sw-sentinel-stop` stops it (record cleared, "N sent, no simple Yes
+received").

@@ -7,7 +7,10 @@
  * and `tabId` is always just the current binding).
  */
 
-import { STATUS, SESSION_EVENT_RING, MAX_SESSIONS, NAME_MAX, MESSAGE_MAX, SENTINEL_MAX_PROMPTS } from "./protocol.js";
+import {
+  STATUS, SESSION_EVENT_RING, MAX_SESSIONS, NAME_MAX, MESSAGE_MAX,
+  SENTINEL_MAX_PROMPTS, SENTINEL_YES_REQUEST, SENTINEL_LOOP_PROMPT_MAX,
+} from "./protocol.js";
 
 /**
  * Create a fresh armed session record.
@@ -28,10 +31,11 @@ export function createSessionRecord(input) {
     titleHint: "",                // first user message text (sensor-derived)
     relaunchMessage: null,        // null = inherit global setting; "" = off; "text" = custom
     pendingMessage: null,         // {text, reason, setAt, attempts} while a send is pending
-    // the sentinel runbook (v1.2): null, or the operator's explicit
-    // prompt queue the extension drives one turn at a time — "runs the
-    // prompts just like we've been doing" (operator 2026-10-15)
-    sentinel: null,               // {queue:[...], total:n, sentCount:n, startedAt:ts}
+    // the sentinel (v1.2/v1.3): null, or the operator's explicit prompt
+    // program — a RUNBOOK (a queue driven one turn at a time) or a
+    // keep-going LOOP (one custom prompt re-sent every turn until the
+    // session replies a simple "Yes" — the roadmap-complete signal)
+    sentinel: null,               // {mode:'runbook'|'loop', queue:[...], total, sentCount, startedAt, prompt?}
     // keep-going ladder (v1.1): when the composer was first seen free
     idleSince: 0,                 // ts of the first turnOpen===false observation
     lastMessageSentAt: 0,         // ts of our last successful relaunch message
@@ -47,6 +51,7 @@ export function createSessionRecord(input) {
     observedServerUpdatedAt: 0,
     queuedSince: 0,
     turnOpen: null,
+    lastAssistantText: null,     // v1.3: last observed assistant reply (the Yes sensor)
     dialogPresent: false,
     authState: "unknown",
     // incident counters (reset on healthy LIVE/IDLE)
@@ -164,7 +169,7 @@ export function sessionUrlFromTab(tabUrl, providerOrigin) {
   return { sessionUrl: `${providerOrigin}/c/${m[1]}`, sessionId: m[1] };
 }
 
-/* ─────────── the sentinel runbook (v1.2 — pure helpers) ─────────── */
+/* ─────────── the sentinel (v1.2 runbook + v1.3 loop — pure helpers) ─────────── */
 
 /**
  * Sanitize an operator runbook: an array of strings OR one newline-
@@ -189,17 +194,82 @@ export function sanitizeSentinelPrompts(raw) {
 }
 
 /**
- * Create the sentinel record (pure).
+ * Create the RUNBOOK sentinel record (v1.2, pure).
  * @param {string[]} prompts  sanitized, non-empty
  * @param {number} now
  */
 export function createSentinel(prompts, now) {
   return {
+    mode: "runbook",
     queue: prompts.slice(),        // remaining prompts; front = next to send
     total: prompts.length,         // original count (the "3/7" display)
     sentCount: 0,                  // confirmed deliveries
     startedAt: typeof now === "number" ? now : 0,
   };
+}
+
+/**
+ * Sanitize the operator's single LOOP prompt (v1.3): trimmed, capped
+ * at SENTINEL_LOOP_PROMPT_MAX so prompt + the Yes-request always fits
+ * the composer bound. "" = nothing to run.
+ * @returns {string}
+ */
+export function sanitizeSentinelPrompt(raw) {
+  if (typeof raw !== "string") return "";
+  const t = raw.trim();
+  if (!t) return "";
+  return t.slice(0, SENTINEL_LOOP_PROMPT_MAX);
+}
+
+/**
+ * The message a LOOP sentinel sends every turn: the operator's custom
+ * prompt + the request to reply a short "Yes" when the roadmap is done
+ * (pure — one law, one shape).
+ * @returns {string}
+ */
+export function sentinelLoopMessage(prompt) {
+  const t = typeof prompt === "string" ? prompt.trim() : "";
+  return `${t}\n\n${SENTINEL_YES_REQUEST}`;
+}
+
+/**
+ * Create the LOOP sentinel record (v1.3, pure): the queue holds the ONE
+ * loop message forever (a loop never drains — only a simple Yes, the
+ * operator's stop, or an exhausted budget ends it).
+ * @param {string} prompt  sanitized, non-empty
+ * @param {number} now
+ */
+export function createSentinelLoop(prompt, now) {
+  return {
+    mode: "loop",
+    queue: [sentinelLoopMessage(prompt)],
+    total: 0,                     // unbounded by design (0 = "—")
+    sentCount: 0,                 // confirmed deliveries (the "N sent" display)
+    startedAt: typeof now === "number" ? now : 0,
+    prompt: typeof prompt === "string" ? prompt : "",
+  };
+}
+
+/**
+ * THE SIMPLE YES (v1.3 — the loop's stop condition). Strictly the word
+ * "yes" (case-insensitive) alone, wrapped at most in whitespace,
+ * punctuation or rendered-markdown emphasis ("Yes.", " **yes** ",
+ * "YES!"). Anything else — "Yes, and here is the summary…", "almost
+ * done", an empty string, an unknown — is NOT the Yes: the loop keeps
+ * going (the operator's law: "otherwise it keeps sending in the custom
+ * prompt").
+ * @returns {boolean}
+ */
+export function isSimpleYes(text) {
+  if (typeof text !== "string") return false;
+  let t = text.trim();
+  if (!t || t.length > 24) return false; // a simple Yes is SHORT by definition
+  // strip surrounding emphasis/quote/whitespace wrappers (leftovers of
+  // rendered markdown), then trailing sentence punctuation
+  t = t.replace(/^[\s*_`'>"\u201C\u2018\[]+/, "");
+  t = t.replace(/[\s*_`'<"\u201D\u2019\]]+$/, "");
+  t = t.replace(/[.!?,;:~\u2026]+$/, "");
+  return t.toLowerCase() === "yes";
 }
 
 /**
@@ -214,28 +284,38 @@ export function sentinelNextPrompt(session) {
 }
 
 /**
- * Progress label for events/notifications: the prompt ABOUT to be sent
- * is sentCount+1 of total ("3/7").
+ * Progress label for events/notifications (mode-aware):
+ *   runbook — the prompt ABOUT to be sent is sentCount+1 of total ("3/7")
+ *   loop    — confirmed sends so far ("3 sent")
  * @returns {string}
  */
 export function sentinelProgress(session) {
   const sen = session && session.sentinel;
   if (!sen || typeof sen !== "object") return "0/0";
   const sent = typeof sen.sentCount === "number" ? sen.sentCount : 0;
+  if (sen.mode === "loop") return `${sent} sent`;
   const total = typeof sen.total === "number" ? sen.total : sen.queue ? sen.queue.length : 0;
   return `${Math.min(sent + 1, Math.max(total, 1))}/${total}`;
 }
 
 /**
- * Advance the runbook after a CONFIRMED delivery of `text` (mutates the
- * record). A text that is not the queue head never consumes a prompt —
- * a manual relaunch message must not eat the runbook.
+ * Advance after a CONFIRMED delivery of `text` (mutates the record):
+ *   runbook — the queue head is consumed ("advanced"/"complete")
+ *   loop    — the counter moves, the queue NEVER drains ("advanced"
+ *             forever; only the Yes, the operator's stop, or an
+ *             exhausted budget ends a loop)
+ * A text that is not the queue head never consumes anything — a manual
+ * relaunch message must not eat the sentinel.
  * @returns {"advanced"|"complete"|"ignored"}
  */
 export function advanceSentinel(session, text) {
   const sen = session && session.sentinel;
   if (!sen || typeof sen !== "object" || !Array.isArray(sen.queue)) return "ignored";
   if (sen.queue.length === 0 || sen.queue[0] !== text) return "ignored";
+  if (sen.mode === "loop") {
+    sen.sentCount = (typeof sen.sentCount === "number" ? sen.sentCount : 0) + 1;
+    return "advanced";
+  }
   sen.queue.shift();
   sen.sentCount = (typeof sen.sentCount === "number" ? sen.sentCount : 0) + 1;
   return sen.queue.length === 0 ? "complete" : "advanced";

@@ -220,7 +220,10 @@ function buildVariant(variant) {
   mkdirSync(join(out, "offscreen"), { recursive: true });
 
   writeFileSync(join(out, "manifest.json"), JSON.stringify(manifestFor(variant, VERSION), null, 2));
-  writeFileSync(join(out, "background.js"), bundle("background/background.js"));
+  // the build marker (v1.3): the bundled worker reports the version of the
+  // SCRIPT it executes — a stale cached worker keeps answering the old one,
+  // which is exactly how the E2E detects it (swBuild in sw-get-state)
+  writeFileSync(join(out, "background.js"), bundle("background/background.js").replaceAll("__SW_BUILD__", VERSION));
   writeFileSync(join(out, "content.js"), bundle("content/content.js"));
   for (const f of ["popup.html", "popup.css", "popup.js"]) {
     copyFileSync(join(SRC, "popup", f), join(out, "popup", f));

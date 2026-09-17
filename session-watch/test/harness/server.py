@@ -65,6 +65,7 @@ class Chat:
         self.roll_to = None
         self.mutation_script = True
         self.block_send = False  # v1.1: the composer submit goes nowhere
+        self.assistant_override = None  # v1.3: the rendered last assistant reply (the Yes sensor)
         # the message tree: a completed user+assistant pair, plus an open
         # assistant placeholder while a turn is generating/frozen.
         self.messages = {
@@ -234,6 +235,10 @@ def apply_control(chat_id: str, action: str, arg=None):
             chat.dialog = None
             chat.updated_frozen = False
             chat.touch()
+        elif action == "assistant-say":
+            # v1.3: the next page render shows this as the last assistant
+            # reply (the keep-going loop's Yes sensor reads the transcript)
+            chat.assistant_override = str(arg or "")
         elif action == "block-send":
             chat.block_send = True
         elif action == "unblock-send":
@@ -419,7 +424,10 @@ STATIC_JS = "  /* static DOM: no streaming (frozen/queued) */"
 
 def render_page(chat: Chat) -> str:
     turn_open = chat.mode in ("generating", "frozen", "silent", "queued")
-    assistant = "Understood. Beginning implementation now." if chat.has_assistant_content() else ""
+    if chat.assistant_override is not None:
+        assistant = chat.assistant_override
+    else:
+        assistant = "Understood. Beginning implementation now." if chat.has_assistant_content() else ""
     email = GUEST_EMAIL if chat.signed_out else OPERATOR_EMAIL
     token = make_jwt(email)
     if chat.mode == "queued":

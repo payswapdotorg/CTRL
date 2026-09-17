@@ -459,6 +459,25 @@ button:focus-visible, a:focus-visible {
 }
 .sw-sen-text:focus { border-color: var(--accent); outline: none; }
 .sw-sen-text::placeholder { color: var(--muted); }
+.sw-sen-loop-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 9px;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.sw-sen-loop-input:focus { border-color: var(--accent); outline: none; }
+.sw-sen-loop-input::placeholder { color: var(--muted); }
+.sw-sen-hint {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--muted);
+  padding: 0 2px;
+}
 
 /* ── v1.1: settings extras (keep-going, alerts) ──────────────── */
 

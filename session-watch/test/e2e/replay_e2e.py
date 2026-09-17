@@ -181,26 +181,47 @@ def new_chat(title):
 # ─────────────────────────── extension surface ───────────────────────────
 
 
-def find_extension_id(wake=True):
-    def scan():
-        for t in cdp_tabs():
-            url = t.get("url", "")
-            if url.startswith("chrome-extension://") and "/background.js" in url:
-                return url.split("/")[2].split("/")[0]
-        return None
+def extension_candidates():
+    """Every chrome-extension service-worker target id (Sep-17 lesson:
+    Chrome's built-in glic extension ALSO runs a background.js — an
+    unverified scan can grab the WRONG extension's id)."""
+    ids = []
+    for t in cdp_tabs():
+        url = t.get("url", "")
+        if url.startswith("chrome-extension://") and "/background.js" in url:
+            ext_id = url.split("/")[2]
+            if ext_id not in ids:
+                ids.append(ext_id)
+    return ids
 
-    hit = scan()
-    if hit:
-        return hit
+
+def verify_ours(ext_id):
+    """A candidate is OURS exactly when its popup page carries our title
+    (glic and other background.js extensions answer nothing there)."""
+    try:
+        t, tid = open_tab(f"chrome-extension://{ext_id}/popup/popup.html")
+        time.sleep(0.8)
+        title = t.ev("document.title", timeout=8)
+        close_tab(tid)
+        return title == "Session Watchdog"
+    except Exception:
+        return False
+
+
+def find_extension_id(wake=True):
+    for ext_id in extension_candidates():
+        if verify_ours(ext_id):
+            return ext_id
     if wake:
-        # MV3 service workers go dormant; a content-script page wakes the
-        # background (the announce message), which surfaces the target
+        # MV3 service workers go dormant (ours does not boot until a
+        # content page announces); ANY page on the harness origin injects
+        # the content script, whose announce wakes our worker
         t, tid = open_tab(f"{HARNESS}/wake")
         time.sleep(2.0)
         close_tab(tid)
-        hit = scan()
-        if hit:
-            return hit
+        for ext_id in extension_candidates():
+            if verify_ours(ext_id):
+                return ext_id
         # Chrome 151 lesson: --load-extension can half-register (the SW
         # boots once, then blocks). The CDP Extensions domain (armed by
         # --enable-unsafe-extension-automation) loads it deterministically.
@@ -214,10 +235,47 @@ def find_extension_id(wake=True):
             time.sleep(2.0)
         except Exception as e:
             log(f"  Extensions.loadUnpacked fallback failed: {e}")
-        hit = scan()
-        if hit:
-            return hit
+        for ext_id in extension_candidates():
+            if verify_ours(ext_id):
+                return ext_id
     return None
+
+
+def sw_target():
+    for t in cdp_tabs():
+        if t.get("url", "").startswith("chrome-extension://") and t.get("url", "").endswith("/background.js"):
+            return t
+    return None
+
+
+def expected_build():
+    pkg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "package.json")
+    return json.load(open(pkg)).get("version")
+
+
+def assert_fresh_sw(state):
+    """The Sep-17 v1.3 lesson: a PERSISTED unpacked extension (a
+    loadUnpacked registration rides the profile across Chrome restarts)
+    can serve a STALE service-worker SCRIPT from the profile's script
+    cache after a rebuild — v1.3 files on disk, the live worker still
+    running v1.2 code and answering 'no-prompts' to a loop arm. The
+    manifest cannot detect this (Chrome re-reads it from disk at every
+    boot), so the worker carries SW_BUILD — the version baked into the
+    script at bundle time — exposed as swBuild in sw-get-state. This
+    guard makes the suite REFUSE to drive anything but the code that
+    was just built. (A chrome.runtime.reload() from CDP was tried as a
+    self-heal and half-broke the registration — the Chrome 151 class —
+    so a loud failure with the fix is the honest repair.)"""
+    got = (state or {}).get("swBuild")
+    want = expected_build()
+    if got != want:
+        raise SystemExit(
+            f"STALE SERVICE WORKER: swBuild={got!r} but the build is {want!r}. "
+            "The profile's SW script cache is serving an old script. Fix: stop Chrome, "
+            "delete <profile>/Default/'Service Worker' and <profile>/Default/'Code Cache', "
+            "start Chrome again, re-run. (v1.3 Sep-17 lesson)"
+        )
+    log(f"swBuild {got} == the built version — the live worker IS the code just built")
 
 
 class Popup:
@@ -370,6 +428,11 @@ def main():
     if not (r or {}).get("ok"):
         raise SystemExit(f"settings failed: {r}")
     log(f"providerOrigin -> {HARNESS} (freeze 120s, turn-end grace 30s)")
+
+    # the Sep-17 v1.3 guard: the live worker must BE the code just built
+    # (a stale cached SW script otherwise answers for old code silently)
+    assert_fresh_sw(popup.state())
+
     QUIET = 128  # freezeSeconds + margin
     GRACE = 40   # turnEndGraceSeconds + margin
 
@@ -711,6 +774,98 @@ def main():
     sm = session_by_url(st, mur)
     check("M10 sentinel-stop event + record cleared", bool(sm and "sentinel-stop" in events_of(sm) and not sm.get("sentinel")), str(events_of(sm)))
 
+    # ── N. THE KEEP-GOING LOOP (v1.3): the custom prompt + the Yes- ──
+    #    request re-sent every turn; a simple Yes stops it ────────────
+    log("N. sentinel keep-going loop")
+    cid_n, tab_n, tid_n = fresh_session("worker-loop")
+    time.sleep(2.5)
+    nur = f"{HARNESS}/c/{cid_n}"
+    control(cid_n, "normal")
+    # a STALE "Yes" sits in the transcript from before arming — a fresh
+    # loop must still SEND first (the Yes must answer OUR prompt)
+    control(cid_n, "assistant-say", "Yes")
+    tab_n.navigate(nur)  # idle shape: turn closed, transcript ends in "Yes"
+    time.sleep(2.0)
+
+    r = popup.raw_send({"evt": "sw-sentinel-start", "sessionUrl": nur, "mode": "loop", "prompt": "continue working on the roadmap"})
+    sn = (r or {}).get("session", {}).get("sentinel") or {}
+    check("N1 loop armed (mode+prompt)", bool(r and r.get("ok") and sn.get("mode") == "loop" and sn.get("prompt") == "continue working on the roadmap"), str(r))
+
+    def _loop_first(st_):
+        s = session_by_url(st_ or {}, nur)
+        msgs = harness_messages(cid_n)
+        return bool(
+            s
+            and (s.get("sentinel") or {}).get("sentCount", 0) >= 1
+            and any(t.startswith("continue working on the roadmap") for t in msgs)
+        )
+
+    log("  pumping ticks through the grace until the loop message lands…")
+    st = pump_until(popup, _loop_first, timeout_s=180, interval=5.0)
+    msgs = harness_messages(cid_n)
+    YES_REQ = 'If the entirety of the roadmap is implemented, reply with just "Yes" and nothing else.'
+    check(
+        "N2 the loop message = custom prompt + the Yes-request",
+        any(t.startswith("continue working on the roadmap\n\n") and t.endswith(YES_REQ) for t in msgs),
+        str(msgs)[:220],
+    )
+    check(
+        "N3 the STALE pre-arm Yes did NOT stop the fresh loop",
+        any(t.startswith("continue working on the roadmap") for t in msgs),
+        str(msgs)[:220],
+    )
+
+    # the turn opened on the send; answer with a NON-Yes and close it
+    control(cid_n, "assistant-say", "Working: 3 roadmap items remain.")
+    control(cid_n, "normal")
+    tab_n.navigate(nur)
+    time.sleep(2.0)
+
+    def _loop_second(st_):
+        s = session_by_url(st_ or {}, nur)
+        msgs = harness_messages(cid_n)
+        return bool(
+            s
+            and (s.get("sentinel") or {}).get("sentCount", 0) >= 2
+            and sum(1 for t in msgs if t.startswith("continue working on the roadmap")) >= 2
+        )
+
+    log("  pumping ticks until the loop sends AGAIN (the reply was not a Yes)…")
+    st = pump_until(popup, _loop_second, timeout_s=180, interval=5.0)
+    sm = session_by_url(st or {}, nur)
+    check("N4 a non-Yes reply -> the custom prompt is sent AGAIN", bool(sm and (sm.get("sentinel") or {}).get("sentCount", 0) >= 2), str((sm or {}).get("sentinel")))
+
+    # now the roadmap is done: the session replies a simple Yes
+    sent_before_yes = sum(1 for t in harness_messages(cid_n) if t.startswith("continue working on the roadmap"))
+    control(cid_n, "assistant-say", "Yes")
+    control(cid_n, "normal")
+    tab_n.navigate(nur)
+    time.sleep(2.0)
+
+    def _loop_done(st_):
+        s = session_by_url(st_ or {}, nur)
+        return bool(s and "sentinel-yes" in events_of(s) and "sentinel-complete" in events_of(s) and not s.get("sentinel"))
+
+    log("  pumping ticks until the simple Yes stops the loop…")
+    st = pump_until(popup, _loop_done, timeout_s=180, interval=5.0)
+    sm = session_by_url(st or {}, nur)
+    msgs = harness_messages(cid_n)
+    sent_after_yes = sum(1 for t in msgs if t.startswith("continue working on the roadmap"))
+    check("N5 the simple Yes -> sentinel-yes + complete + record cleared", bool(sm and "sentinel-yes" in events_of(sm) and not sm.get("sentinel")), str(events_of(sm)))
+    check("N6 NOTHING is sent after the Yes", sent_after_yes == sent_before_yes, f"{sent_before_yes} before, {sent_after_yes} after")
+
+    # diagnostics carry the loop story while one is armed; the operator
+    # can stop a loop too
+    r = popup.raw_send({"evt": "sw-sentinel-start", "sessionUrl": nur, "mode": "loop", "prompt": "keep going forever"})
+    check("N7 second loop armed", bool(r and r.get("ok")), str(r))
+    d = popup.export_diag()
+    text = (d or {}).get("text") or ""
+    check("N8 diagnostics carry the loop", "LOOP" in text and "waiting for a simple Yes" in text and "keep going forever" in text, text[:300])
+    r = popup.raw_send({"evt": "sw-sentinel-stop", "sessionUrl": nur})
+    st = popup.state()
+    sm = session_by_url(st, nur)
+    check("N9 loop stopped by the operator (record cleared)", bool(r and r.get("ok") and sm and not sm.get("sentinel")), str(events_of(sm)))
+
     # ── final: the badge + honest summary ─────────────────────────
     st = popup.state()
     total = len([s for s in st.get("sessions", []) if s.get("armed")])
@@ -724,7 +879,7 @@ def main():
 
     if not keep:
         popup.close()
-        cleanup_ids = [tid_e, tid_j, tid_k, tid_l, tid_m, find_tab_id_for_session(cid_a)]
+        cleanup_ids = [tid_e, tid_j, tid_k, tid_l, tid_m, tid_n, find_tab_id_for_session(cid_a)]
         cleanup_ids = [t for t in cleanup_ids if t and str(t) != str(tid_a)]
         cleanup_ids.append(tid_a)
         for tid in cleanup_ids:

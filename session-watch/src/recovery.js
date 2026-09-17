@@ -9,7 +9,9 @@
  */
 
 import { STATUS, classifyUrl } from "./protocol.js";
-import { resetIncident, labelOf, sentinelNextPrompt, sentinelProgress } from "./state.js";
+import {
+  resetIncident, labelOf, sentinelNextPrompt, sentinelProgress, isSimpleYes,
+} from "./state.js";
 
 /** Typed plan action kinds. */
 export const ACTION = Object.freeze({
@@ -443,19 +445,50 @@ function keepGoingPlan(input) {
 }
 
 /**
- * THE SENTINEL ladder (v1.2, DESIGN §11): an armed runbook of prompts
- * runs the session — one prompt per turn, in order, exactly like the
- * operator driving it by hand. The composer being free is the trigger;
- * the same quiet grace applies (the operator may be mid-thought, the
- * UI may still be settling); the same bounded budget applies (a turn
- * reopening resets it — productive runbooks are infinite; a blocked
- * loop terminates in NEEDS_INPUT with the queue INTACT for a manual
- * relaunch to resume).
+ * THE SENTINEL ladder (v1.2 runbook, DESIGN §11; v1.3 loop, §12): an
+ * armed sentinel runs the session exactly like the operator driving it
+ * by hand. The composer being free is the trigger; the same quiet grace
+ * applies (the operator may be mid-thought, the UI may still be
+ * settling); the same bounded budget applies (a turn reopening resets
+ * it — productive sentinels are infinite; a blocked one terminates in
+ * NEEDS_INPUT with its program INTACT for a manual relaunch to resume).
+ *
+ * The LOOP's stop condition (v1.3) is checked FIRST, before any guard:
+ * a simple "Yes" reply — the signal that "the entirety of the roadmap
+ * is implemented" — completes the loop. It is a pure read (no
+ * actuation), so it fires even while a human draft is present. The Yes
+ * must ANSWER OUR PROMPT: only replies observed after the loop's first
+ * confirmed delivery count (a stale Yes from before arming never stops
+ * a fresh loop).
  */
 function sentinelPlan(input) {
   const { now, settings, session, snapshot } = input;
   const graceMs = settings.turnEndGraceSeconds * 1000;
   const prompt = sentinelNextPrompt(session);
+  const sen = session.sentinel;
+
+  // 0. THE YES CHECK (v1.3 — the loop's stop condition, a pure read):
+  // the session was asked, on every send, to reply a short "Yes" once
+  // the roadmap is done. A simple Yes completes the loop — sentinel
+  // stops, chime, and the custom prompt is never sent again.
+  if (sen && sen.mode === "loop" && (sen.sentCount || 0) >= 1) {
+    const reply =
+      typeof snapshot.lastAssistantText === "string"
+        ? snapshot.lastAssistantText
+        : session.lastAssistantText || null;
+    if (isSimpleYes(reply)) {
+      return plan(STATUS.IDLE, ACTION.EVENT_ONLY, "sentinel-yes", {
+        sentinelDone: true,
+        resetIncident: true,
+        clearIdle: true,
+        notify: {
+          kind: "sentinel",
+          message: `Sentinel: ${labelOf(session)} replied a simple Yes — the roadmap is complete (${sen.sentCount} prompt${sen.sentCount === 1 ? "" : "s"} delivered)`,
+        },
+        events: [ev(now, "sentinel-yes", `assistant replied a simple Yes after ${sen.sentCount} prompt(s) — roadmap complete; loop stopped`)],
+      });
+    }
+  }
 
   // a human draft: the sentinel WAITS, never clobbers (the same law)
   if (snapshot.composerHasDraft === true) {
@@ -483,7 +516,7 @@ function sentinelPlan(input) {
     });
   }
 
-  // grace passed: send the next runbook prompt
+  // grace passed: send the next runbook prompt / the loop message again
   if ((session.relaunchAttempts || 0) < settings.relaunchCap) {
     return plan(STATUS.RECOVERING, ACTION.SEND_MESSAGE, "sentinel-next", {
       relaunchAttempt: true,
@@ -492,20 +525,23 @@ function sentinelPlan(input) {
       clearIdle: true,
       notify: {
         kind: "relaunched",
-        message: `Session ${labelOf(session)} sentinel ${sentinelProgress(session)} — sending "${trimTo(prompt, 60)}"`,
+        message:
+          sen && sen.mode === "loop"
+            ? `Session ${labelOf(session)} sentinel loop (${sentinelProgress(session)}) — the reply was not a Yes; sending "${trimTo(sen.prompt || prompt, 60)}" again`
+            : `Session ${labelOf(session)} sentinel ${sentinelProgress(session)} — sending "${trimTo(prompt, 60)}"`,
       },
-      events: [ev(now, "sentinel-send", `sentinel ${sentinelProgress(session)}: sending the next prompt past the ${settings.turnEndGraceSeconds}s grace`)],
+      events: [ev(now, "sentinel-send", `sentinel ${sentinelProgress(session)}: sending the ${sen && sen.mode === "loop" ? "loop message again (no simple Yes yet)" : "next prompt"} past the ${settings.turnEndGraceSeconds}s grace`)],
     });
   }
 
-  // budget exhausted — the runbook is STUCK, not dropped: the queue
+  // budget exhausted — the sentinel is STUCK, not dropped: the program
   // stays armed so a manual relaunch (which resets the budget) resumes it
   return plan(STATUS.NEEDS_INPUT, ACTION.EVENT_ONLY, "sentinel-budget", {
     notify: {
       kind: "needsInput",
       message: `Session ${labelOf(session)} sentinel stuck at ${sentinelProgress(session)} — ${settings.relaunchCap} sends failed to reopen the turn; it needs you`,
     },
-    events: [ev(now, "sentinel-blocked", "sentinel sends exhausted the relaunch budget; queue kept for a manual relaunch to resume")],
+    events: [ev(now, "sentinel-blocked", "sentinel sends exhausted the relaunch budget; program kept for a manual relaunch to resume")],
   });
 }
 

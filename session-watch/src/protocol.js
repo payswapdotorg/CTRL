@@ -90,6 +90,20 @@ export const PENDING_MESSAGE_ATTEMPTS = 3;
 export const ALARM_HARD_STOP_MS = 30 * 60 * 1000;
 /** v1.2 — the sentinel runbook bounds (a queue of prompts, one per turn). */
 export const SENTINEL_MAX_PROMPTS = 100;
+/**
+ * v1.3 — the keep-going LOOP (operator 2026-10-15): "the sentinel
+ * should keep a session going by sending in a custom prompt + a request
+ * for the session to reply with a short Yes message in case the entirety
+ * of the roadmap is implemented. If it receives a simple Yes then it
+ * should stop, otherwise it keeps sending in the custom prompt."
+ * Every loop message is `<custom prompt>\n\n<YES_REQUEST>` — the request
+ * rides EVERY send, so the stop condition is always in play.
+ */
+export const SENTINEL_YES_REQUEST =
+  'If the entirety of the roadmap is implemented, reply with just "Yes" and nothing else.';
+/** The custom prompt is capped so prompt + "\n\n" + request fits MESSAGE_MAX. */
+export const SENTINEL_LOOP_PROMPT_MAX =
+  MESSAGE_MAX - (SENTINEL_YES_REQUEST.length + 2);
 
 /** Notification kinds that ring the LOOPING SIREN (needs a human). */
 export const ALARM_SIREN_KINDS = Object.freeze([

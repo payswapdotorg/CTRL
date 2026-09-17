@@ -16,8 +16,8 @@ import {
 import {
   createSessionRecord, pushSessionEvent, resetIncident,
   resetRelaunchBudget, mayNotify, markNotified, boundSessions,
-  sessionUrlFromTab, labelOf, sanitizeSentinelPrompts, createSentinel,
-  advanceSentinel,
+  sessionUrlFromTab, labelOf, sanitizeSentinelPrompts, sanitizeSentinelPrompt,
+  createSentinel, createSentinelLoop, advanceSentinel,
 } from "../state.js";
 import { planAction, ACTION, effectiveRelaunchMessage } from "../recovery.js";
 import { makeNotify } from "./notify.js";
@@ -36,6 +36,16 @@ const notifier = makeNotify(
 /** Boot grace: tab-missing verdicts wait out browser-startup tab restore. */
 const BOOT_GRACE_MS = 90 * 1000;
 let bootedAt = Date.now();
+
+/** The build marker (v1.3): build.mjs substitutes this placeholder with
+ *  package.json's version at bundle time. Unlike the manifest (re-read
+ *  from disk at every browser boot), this rides the SCRIPT the worker is
+ *  actually executing — so a stale service-worker script cached in the
+ *  profile keeps answering with the OLD marker. sw-get-state exposes it
+ *  as swBuild and the E2E asserts it, so the suite can never drive code
+ *  that was not just built (the Sep-17 lesson: v1.3 files on disk, a
+ *  cached v1.2 worker live, answering "no-prompts" to a loop arm). */
+const SW_BUILD = "__SW_BUILD__";
 
 /** In-memory cache of persisted state (single writer: this worker). */
 let settings = normalizeSettings(null);
@@ -170,10 +180,24 @@ async function serverProbeFact(session) {
 /* ────────────────────────── the keep-going send ────────────────────────── */
 
 /**
+ * Complete a sentinel (runbook drained OR loop answered a simple Yes):
+ * clear the record, log the completion, chime through the same throttled
+ * notify() path as every other alert (cooldown map: sentinel = 5 min).
+ */
+function finishSentinel(session, eventDetail, chimeMessage) {
+  session.sentinel = null;
+  pushSessionEvent(session, { ts: Date.now(), kind: "sentinel-complete", detail: eventDetail });
+  globalEvent("sentinel-complete", `${labelOf(session)}: ${eventDetail}`, session.sessionId);
+  notify(session, { kind: "sentinel", message: chimeMessage });
+}
+
+/**
  * Post-send sentinel bookkeeping (v1.2): advance the runbook on a
  * CONFIRMED delivery, announce progress, and chime + notify when the
  * runbook finishes. A `text` that is not the queue head never consumes
- * a prompt (advanceSentinel's own guard).
+ * a prompt (advanceSentinel's own guard). A LOOP (v1.3) never finishes
+ * here — only a simple Yes (the ladder's sentinel-yes plan) or the
+ * operator's stop ends a loop.
  */
 function sentinelAfterSend(session, text) {
   if (!session || !session.sentinel) return;
@@ -183,19 +207,18 @@ function sentinelAfterSend(session, text) {
   const now = Date.now();
   if (outcome === "complete") {
     const total = sen ? sen.total : 0;
-    session.sentinel = null;
+    finishSentinel(
+      session,
+      `runbook finished — ${total} prompt${total === 1 ? "" : "s"} delivered`,
+      `Sentinel finished — ${total} prompt${total === 1 ? "" : "s"} delivered to ${labelOf(session)}`
+    );
+  } else if (sen.mode === "loop") {
     pushSessionEvent(session, {
       ts: now,
-      kind: "sentinel-complete",
-      detail: `runbook finished — ${total} prompt${total === 1 ? "" : "s"} delivered`,
+      kind: "sentinel-send",
+      detail: `loop message ${sen.sentCount} delivered; waiting for a simple Yes`,
     });
-    globalEvent("sentinel-complete", `${labelOf(session)}: runbook finished (${total} prompts delivered)`, session.sessionId);
-    // the completion chime rides the same throttled notify() path as
-    // every other alert (cooldown map: sentinel = 5 min)
-    notify(session, {
-      kind: "sentinel",
-      message: `Sentinel finished — ${total} prompt${total === 1 ? "" : "s"} delivered to ${labelOf(session)}`,
-    });
+    globalEvent("sentinel-send", `${labelOf(session)}: loop message ${sen.sentCount} delivered (waiting for a simple Yes)`, session.sessionId);
   } else {
     pushSessionEvent(session, {
       ts: now,
@@ -303,6 +326,18 @@ function applyPlanMeta(session, plan) {
   // keep-going flags (applied AFTER resetIncident so they always win)
   if (typeof plan.setIdleSince === "number") session.idleSince = plan.setIdleSince;
   if (plan.clearIdle) session.idleSince = 0;
+  // v1.3: the loop's Yes verdict — the sentinel completes at PLAN time
+  // (the reply was OBSERVED, not sent); same completion path as a
+  // drained runbook: clear, log, chime
+  if (plan.sentinelDone && session.sentinel) {
+    const sen = session.sentinel;
+    const sent = typeof sen.sentCount === "number" ? sen.sentCount : 0;
+    finishSentinel(
+      session,
+      `loop complete — the session replied a simple Yes after ${sent} prompt${sent === 1 ? "" : "s"}`,
+      `Sentinel: ${labelOf(session)} replied a simple Yes — the roadmap is complete (${sent} prompt${sent === 1 ? "" : "s"} delivered)`
+    );
+  }
   for (const e of plan.events || []) pushSessionEvent(session, e);
   if ((plan.events || []).length > 0 || plan.action !== ACTION.NONE) {
     session.lastCheckAt = now;
@@ -432,6 +467,7 @@ async function checkSession(session) {
     session.turnOpen = snap.turnOpen === true ? true : snap.turnOpen === false ? false : null;
     if (snap.turnOpen === true) session.idleSince = 0; // an open turn ends any idle window
     if (typeof snap.lastMutationAt === "number") session.lastMutationAt = snap.lastMutationAt;
+    if (typeof snap.lastAssistantText === "string") session.lastAssistantText = snap.lastAssistantText; // v1.3: the Yes sensor
     if (snap.auth && typeof snap.auth.state === "string") session.authState = snap.auth.state;
     session.dialogPresent = !!(snap.dialog && snap.dialog.present);
     if (!session.titleHint && typeof snap.titleHint === "string" && snap.titleHint) {
@@ -618,6 +654,7 @@ async function handleMessage(msg, sender) {
         events: globalEvents.slice(-60),
         alarmInfo: notifier.alarmInfo(),
         version,
+        swBuild: SW_BUILD,
         bootedAt,
       };
     }
@@ -653,6 +690,7 @@ async function handleMessage(msg, sender) {
             return "?";
           }
         })(),
+        swBuild: SW_BUILD, // the SCRIPT's build (a stale cached worker answers the old one)
         now: Date.now(),
         bootedAt,
         settings,
@@ -729,13 +767,32 @@ async function handleMessage(msg, sender) {
       return { ok: true };
     }
     case EVT.SENTINEL_START: {
-      // v1.2 — the operator's runbook: "have the extension setup a
-      // sentinel that runs the prompts just like we've been doing."
-      // One prompt per turn, in order, starting from the next free
-      // composer past the grace. A fresh runbook supersedes any stale
+      // v1.2/v1.3 — the operator's sentinel: "have the extension setup
+      // a sentinel that runs the prompts just like we've been doing."
+      // RUNBOOK: a queue of prompts, one per turn, in order. LOOP: one
+      // custom prompt re-sent every turn, each send carrying the request
+      // to reply a short "Yes" when the roadmap is done — the loop stops
+      // on that Yes. Either way: a fresh sentinel supersedes any stale
       // pending send and opens a fresh budget.
       const rec = sessions[msg.sessionUrl];
       if (!rec) return { ok: false, error: "unknown-session" };
+      if (msg.mode === "loop") {
+        const prompt = sanitizeSentinelPrompt(msg.prompt);
+        if (!prompt) return { ok: false, error: "no-prompt" };
+        rec.sentinel = createSentinelLoop(prompt, Date.now());
+        rec.pendingMessage = null; // the loop supersedes the stale queue
+        resetRelaunchBudget(rec);
+        if (rec.status === STATUS.NEEDS_INPUT) rec.status = STATUS.WATCHING;
+        pushSessionEvent(rec, {
+          ts: Date.now(),
+          kind: "sentinel-start",
+          detail: `loop armed — re-sending "${prompt.slice(0, 60)}" every turn until the session replies a simple Yes`,
+        });
+        globalEvent("sentinel-start", `${labelOf(rec)}: keep-going loop armed ("${prompt.slice(0, 40)}…" until a simple Yes)`, rec.sessionId);
+        updateBadge();
+        persist();
+        return { ok: true, session: rec };
+      }
       const prompts = sanitizeSentinelPrompts(msg.prompts);
       if (prompts.length === 0) return { ok: false, error: "no-prompts" };
       rec.sentinel = createSentinel(prompts, Date.now());
@@ -756,15 +813,18 @@ async function handleMessage(msg, sender) {
       const rec = sessions[msg.sessionUrl];
       if (!rec || !rec.sentinel) return { ok: false, error: "no-sentinel" };
       const sen = rec.sentinel;
+      const isLoop = sen.mode === "loop";
       const delivered = typeof sen.sentCount === "number" ? sen.sentCount : 0;
       const total = typeof sen.total === "number" ? sen.total : 0;
       rec.sentinel = null;
       pushSessionEvent(rec, {
         ts: Date.now(),
         kind: "sentinel-stop",
-        detail: `runbook stopped by the operator — ${delivered}/${total} delivered, ${(sen.queue || []).length} left`,
+        detail: isLoop
+          ? `loop stopped by the operator — ${delivered} sent, no simple Yes received`
+          : `runbook stopped by the operator — ${delivered}/${total} delivered, ${(sen.queue || []).length} left`,
       });
-      globalEvent("sentinel-stop", `${labelOf(rec)}: runbook stopped (${delivered}/${total} delivered)`, rec.sessionId);
+      globalEvent("sentinel-stop", `${labelOf(rec)}: ${isLoop ? "loop" : "runbook"} stopped (${delivered}${isLoop ? " sent" : `/${total} delivered`})`, rec.sessionId);
       persist();
       return { ok: true };
     }

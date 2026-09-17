@@ -241,25 +241,34 @@ function sessionCard(s) {
   msgRow.append(msgLabel, msgSel, msgInput, msgSave);
   card.appendChild(msgRow);
 
-  // the sentinel runbook (v1.2): "have the extension setup a sentinel
-  // that runs the prompts just like we've been doing" — a queue of
-  // prompts the extension sends one per turn, in order, automatically
+  // the sentinel (v1.2 runbook / v1.3 keep-going loop): "have the
+  // extension setup a sentinel that runs the prompts just like we've
+  // been doing" — a queue of prompts sent one per turn, in order, OR a
+  // single custom prompt re-sent every turn until the session replies a
+  // simple "Yes" (the roadmap-complete signal)
   const senRow = el("div", "sw-sen-row");
   const sen = s.sentinel && Array.isArray(s.sentinel.queue) ? s.sentinel : null;
   if (sen) {
     const info = el("div", "sw-sen-info");
     const sentCount = typeof sen.sentCount === "number" ? sen.sentCount : 0;
-    const total = typeof sen.total === "number" ? sen.total : sen.queue.length;
-    info.textContent =
-      `\u25B8 sentinel ${sentCount}/${total}` +
-      (sen.queue.length > 0 ? ` \u00b7 next: ${String(sen.queue[0] || "").slice(0, 40)}` : " \u00b7 finishing");
-    info.title =
-      sen.queue.length > 0
-        ? `Runbook armed — ${sen.queue.length} prompt(s) left. The sentinel sends one prompt per turn, in order.`
-        : "Runbook drained — the last prompt's turn is still watched.";
+    if (sen.mode === "loop") {
+      info.textContent =
+        `\u25B8 sentinel loop \u00b7 ${sentCount} sent \u00b7 waiting for a simple Yes`;
+      info.title =
+        "Keep-going loop armed — the custom prompt is re-sent every turn (with the Yes-request appended). When the session replies a simple \"Yes\", the loop stops and chimes.";
+    } else {
+      const total = typeof sen.total === "number" ? sen.total : sen.queue.length;
+      info.textContent =
+        `\u25B8 sentinel ${sentCount}/${total}` +
+        (sen.queue.length > 0 ? ` \u00b7 next: ${String(sen.queue[0] || "").slice(0, 40)}` : " \u00b7 finishing");
+      info.title =
+        sen.queue.length > 0
+          ? `Runbook armed — ${sen.queue.length} prompt(s) left. The sentinel sends one prompt per turn, in order.`
+          : "Runbook drained — the last prompt's turn is still watched.";
+    }
     senRow.appendChild(info);
     const stopBtn = el("button", "sw-btn sw-btn-mini sw-btn-danger", "stop");
-    stopBtn.title = "Stop the sentinel runbook (queued prompts are dropped)";
+    stopBtn.title = "Stop the sentinel (the queued program is dropped)";
     stopBtn.addEventListener("click", async () => {
       stopBtn.disabled = true;
       await send({ evt: EVT.SENTINEL_STOP, sessionUrl: s.sessionUrl });
@@ -268,31 +277,75 @@ function sessionCard(s) {
     senRow.appendChild(stopBtn);
   } else {
     const senToggle = el("button", "sw-btn sw-btn-mini", "sentinel\u2026");
-    senToggle.title = "Run a list of prompts automatically — one per turn, in order, like you driving the session by hand";
+    senToggle.title = "Run prompts automatically — a runbook one per turn in order, or a keep-going loop that re-sends one custom prompt until the session replies a simple Yes";
     const senBox = el("div", "sw-sen-box");
     senBox.hidden = true;
+    // the mode select: runbook (a queue) | loop (one prompt until a Yes)
+    const modeSel = document.createElement("select");
+    modeSel.className = "sw-msg-select";
+    modeSel.setAttribute("aria-label", `Sentinel mode for session ${shortId(s.sessionId)}`);
+    for (const [val, text] of [
+      ["runbook", "runbook (one per turn)"],
+      ["loop", "keep-going loop (until a Yes)"],
+    ]) {
+      const opt = document.createElement("option");
+      opt.value = val;
+      opt.textContent = text;
+      modeSel.appendChild(opt);
+    }
+    // the runbook textarea
     const ta = document.createElement("textarea");
     ta.className = "sw-sen-text";
     ta.rows = 4;
     ta.placeholder = "one prompt per line\u2026\nbuild the flange mount\ncontinue\ncontinue\nship it and summarize";
     ta.setAttribute("aria-label", `Sentinel prompts for session ${shortId(s.sessionId)}`);
+    // the loop prompt input + the fixed Yes-request hint
+    const loopInput = document.createElement("input");
+    loopInput.type = "text";
+    loopInput.className = "sw-msg-input sw-sen-loop-input";
+    loopInput.placeholder = "the custom prompt to keep sending\u2026";
+    loopInput.maxLength = 1900;
+    loopInput.setAttribute("aria-label", `Keep-going loop prompt for session ${shortId(s.sessionId)}`);
+    const loopHint = el("div", "sw-sen-hint");
+    loopHint.textContent = "every send ends with: \u201cIf the entirety of the roadmap is implemented, reply with just \u2018Yes\u2019 and nothing else.\u201d — a simple Yes stops the loop.";
+    loopInput.hidden = true;
+    loopHint.hidden = true;
+    modeSel.addEventListener("change", () => {
+      const loop = modeSel.value === "loop";
+      ta.hidden = loop;
+      loopInput.hidden = !loop;
+      loopHint.hidden = !loop;
+      if (loop) loopInput.focus();
+      else ta.focus();
+    });
     const startBtn = el("button", "sw-btn sw-btn-mini", "start");
     startBtn.title = "Arm the sentinel — prompts are sent one per turn after the turn-end grace";
     startBtn.addEventListener("click", async () => {
       startBtn.disabled = true;
-      const r = await send({ evt: EVT.SENTINEL_START, sessionUrl: s.sessionUrl, prompts: ta.value });
+      const r =
+        modeSel.value === "loop"
+          ? await send({ evt: EVT.SENTINEL_START, sessionUrl: s.sessionUrl, mode: "loop", prompt: loopInput.value })
+          : await send({ evt: EVT.SENTINEL_START, sessionUrl: s.sessionUrl, prompts: ta.value });
       if (!r || !r.ok) {
         startBtn.disabled = false;
-        ta.value = "";
-        ta.placeholder = `cannot arm the sentinel: ${(r && r.error) || "no answer"}`;
+        if (modeSel.value === "loop") {
+          loopInput.value = "";
+          loopInput.placeholder = `cannot arm the loop: ${(r && r.error) || "no answer"}`;
+        } else {
+          ta.value = "";
+          ta.placeholder = `cannot arm the sentinel: ${(r && r.error) || "no answer"}`;
+        }
         return;
       }
       await refresh();
     });
-    senBox.append(ta, startBtn);
+    senBox.append(modeSel, ta, loopInput, loopHint, startBtn);
     senToggle.addEventListener("click", () => {
       senBox.hidden = !senBox.hidden;
-      if (!senBox.hidden) ta.focus();
+      if (!senBox.hidden) {
+        if (modeSel.value === "loop") loopInput.focus();
+        else ta.focus();
+      }
     });
     senRow.append(senToggle, senBox);
   }

@@ -43,7 +43,7 @@ function trimTo(s, n) {
 
 /**
  * Build the copy-paste diagnostics dump (pure).
- * @param {{version:string, now:number, bootedAt?:number, settings:object,
+ * @param {{version:string, swBuild?:string, now:number, bootedAt?:number, settings:object,
  *          sessions:object[], globalEvents?:object[],
  *          alarmInfo?:object}} input
  * @returns {string}
@@ -57,6 +57,12 @@ export function buildDiagDump(input) {
 
   lines.push("=== Session Watchdog diagnostics ===");
   lines.push(`version: ${i.version || "?"}`);
+  // v1.3: the SCRIPT's build marker — differs from `version` exactly when
+  // the profile is serving a stale cached service-worker script (the
+  // Sep-17 lesson); the E2E refuses to run in that state
+  if (i.swBuild && i.swBuild !== i.version) {
+    lines.push(`swBuild: ${i.swBuild}  (!! the running script is NOT the manifest version — a stale cached worker)`);
+  }
   lines.push(`generated: ${iso(i.now || 0)}`);
   if (i.bootedAt) lines.push(`background booted: ${iso(i.bootedAt)}`);
   if (i.alarmInfo) lines.push(`alarm: ${JSON.stringify(i.alarmInfo)}`);
@@ -84,7 +90,11 @@ export function buildDiagDump(input) {
     }
     if (s.sentinel && typeof s.sentinel === "object" && Array.isArray(s.sentinel.queue)) {
       const q = s.sentinel.queue;
-      lines.push(`  sentinel: ${s.sentinel.sentCount || 0}/${s.sentinel.total || 0} delivered, ${q.length} queued; next: ${JSON.stringify(trimTo(String(q[0] || ""), 60))}`);
+      if (s.sentinel.mode === "loop") {
+        lines.push(`  sentinel: LOOP · ${s.sentinel.sentCount || 0} sent · waiting for a simple Yes; prompt: ${JSON.stringify(trimTo(String(s.sentinel.prompt || q[0] || ""), 60))}`);
+      } else {
+        lines.push(`  sentinel: ${s.sentinel.sentCount || 0}/${s.sentinel.total || 0} delivered, ${q.length} queued; next: ${JSON.stringify(trimTo(String(q[0] || ""), 60))}`);
+      }
     }
     const evts = Array.isArray(s.events) ? s.events.slice(-12) : [];
     if (evts.length > 0) {

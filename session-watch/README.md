@@ -28,6 +28,7 @@ lessons 1–122):
 | --- | --- | --- |
 | **stop mid-task** — the turn ends, the composer idles, the task is unfinished (the 2026-10-14 live failure) | operator report | **keep-going**: after a quiet grace window, send the relaunch message ("continue" or your own — per session); failed sends retry, then NEEDS_INPUT + alarm |
 | **the operator's own seat** — driving a session prompt-by-prompt by hand (the 2026-10-15 direction: "a sentinel that runs the prompts just like we've been doing") | operator report | **the sentinel runbook (v1.2)**: give each session a list of prompts — the extension sends them one per turn, in order, to the end, then chimes |
+| **"is the roadmap done yet?"** — keep driving until the work is COMPLETE, not until a list runs out (the 2026-10-15 direction: "if it receives a simple Yes then it should stop, otherwise it keeps sending in the custom prompt") | operator report | **the keep-going loop (v1.3)**: one custom prompt, re-sent every turn with a request to reply a short "Yes" when the entirety of the roadmap is implemented — a simple Yes stops it and chimes |
 | **freeze** — renderer wedges / turn freezes mid-stream | lessons 3.19b, 36, 52, 54, 67 | detect (open turn + no DOM mutation + frozen server `updated_at`), then reload; escalate to fresh tab at the same session URL |
 | **return** — tab rolls back to `https://chat.z.ai/` (home) | lessons 31, 51, 60, 76, 89(a), 95, 111 | verify the chat server-side via the in-page chats LIST API; if it exists navigate the tab back to the session URL **and send the relaunch message** |
 | **die** — session destroyed server-side (absent from chats list) | lessons 28, 60, 87, 97, 98 | bounded relaunch attempts, then DEAD status + notification (manual relaunch stays available) |
@@ -83,6 +84,34 @@ the extension in the operator's seat:
 The diagnostics dump carries the runbook position (`sentinel: 2/4
 delivered, 2 queued; next: …`).
 
+## The keep-going loop (v1.3)
+
+The runbook knows the list; the loop knows the GOAL. Pick **keep-going
+loop (until a Yes)** in the sentinel editor, type ONE custom prompt
+(e.g. `continue working on the roadmap`), and start:
+
+1. Every send is your prompt + a fixed request: *"If the entirety of
+   the roadmap is implemented, reply with just "Yes" and nothing
+   else."* — the stop condition rides every message.
+2. A reply that is anything other than a simple **Yes** (a progress
+   report, "almost done", code, prose) means the work continues: your
+   prompt is sent again next turn, for as long as it takes. A
+   half-typed human draft still pauses it; the loop survives restarts
+   and chat-id rolls.
+3. The moment the session replies exactly **Yes** (wrapped at most in
+   punctuation/emphasis), the loop STOPS: the record clears, a short
+   chime + notification announces "replied a simple Yes — the roadmap
+   is complete (N prompts delivered)", and nothing is ever sent
+   after the Yes.
+4. The card shows live state: `▸ sentinel loop · 3 sent · waiting for
+   a simple Yes`. If sends fail past the relaunch cap: NEEDS_INPUT
+   with the loop **kept** for a manual resume; **stop** drops it.
+
+A simple Yes is strictly the word alone — "Yes", "yes.", "**YES**!"
+count; "Yes, and here's the summary" does not (the loop keeps going).
+The diagnostics dump carries the loop line (`sentinel: LOOP · 3 sent ·
+waiting for a simple Yes; prompt: …`).
+
 ## Install
 
 Requires [bun](https://bun.sh) (or node ≥ 20) to build.
@@ -117,14 +146,17 @@ bun run build          # produces build/chrome, build/firefox, build/test + dist
    default (`continue`), use a custom message, or turn keep-going OFF.
 5. **Sentinel runbooks**: each card runs a prompt list for you — see
    *The sentinel runbook* above.
-6. Statuses: `LIVE` (streaming), `IDLE` (waiting for input), `FROZEN`,
+6. **Keep-going loops**: each card can also run ONE custom prompt in a
+   loop until the session replies a simple "Yes" — see *The keep-going
+   loop* above.
+7. Statuses: `LIVE` (streaming), `IDLE` (waiting for input), `FROZEN`,
    `RECOVERING`, `RETURNED`, `QUEUED`, `STALLED`, `NEEDS_INPUT` (relaunch
    budget exhausted — it needs a human), `DEAD`, `AUTH_REQUIRED`, `GONE`,
    `WEDGED`. The event log shows every automatic action with timestamps.
-7. Settings (popup → gear): check cadence, freeze threshold, relaunch cap,
+8. Settings (popup → gear): check cadence, freeze threshold, relaunch cap,
    keep-going (grace window + message), alarms & email, popup dismissal,
    reopen-on-close, notifications.
-8. **Diagnostics**: footer → *copy diagnostics* — a redacted, paste-ready
+9. **Diagnostics**: footer → *copy diagnostics* — a redacted, paste-ready
    dump (version, settings, per-session verdicts and events) for bug
    reports.
 
